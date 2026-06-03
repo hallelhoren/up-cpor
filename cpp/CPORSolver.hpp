@@ -352,20 +352,65 @@ private:
         return false;
     }
 
-    
-    // Checks if the boolean state space has looped, strictly ignoring metric functions.
-    bool is_logical_cycle(const PartiallySpecifiedState& target_state, const std::vector<int>& current_path_indices) const {
-        for (int hist_idx : current_path_indices) {
-            const auto& hist_state = node_pool[hist_idx].state;
-            
-            // Cycle detection MUST ignore function_values (like accumulated action costs)
-            // otherwise the engine will spin infinitely as numbers increase.
-            if (hist_state.known_mask == target_state.known_mask && 
-                hist_state.value_mask == target_state.value_mask) {
-                return true;
+    // Cycle detection fix comparing actual state bits instead of node indices
+    bool is_logical_cycle(const PartiallySpecifiedState& current_state, const std::vector<int>& path_indices) {
+        for (int idx : path_indices) {
+            if (node_pool[idx].state == current_state) {
+                return true; 
             }
         }
         return false;
+    }
+
+    // Dead end detection using a bitwise Relaxed Planning Graph
+    bool is_dead_end(const PartiallySpecifiedState& base_state) {
+        PartiallySpecifiedState relaxed_state = base_state;
+        bool changed = true;
+
+        while (changed) {
+            changed = false;
+            
+            // Check if goal is satisfied in the relaxed graph
+            if (Evaluator::evaluate_rpn(global_problem.goal_rpn, relaxed_state) == VAL_TRUE) {
+                return false;
+            }
+
+            // Apply all applicable actions accumulating positive facts
+            for (const auto& action : global_problem.actions) {
+                if (Evaluator::evaluate_rpn(action.precondition_rpn, relaxed_state) == VAL_TRUE) {
+                    
+                    // Accumulate guaranteed effects
+                    for (const auto& eff : action.guaranteed_effects) {
+                        int fact_id = eff.first;
+                        bool is_positive = eff.second;
+                        
+                        if (is_positive && !relaxed_state.is_true(fact_id)) {
+                            relaxed_state.known_mask[fact_id / 64] |= (1ULL << (fact_id % 64));
+                            relaxed_state.value_mask[fact_id / 64] |= (1ULL << (fact_id % 64));
+                            changed = true;
+                        }
+                    }
+
+                    // Accumulate conditional effects
+                    for (const auto& cond_eff : action.conditional_effects) {
+                        if (Evaluator::evaluate_rpn(cond_eff.condition_rpn, relaxed_state) == VAL_TRUE) {
+                            for (const auto& eff : cond_eff.effects) {
+                                int fact_id = eff.first;
+                                bool is_positive = eff.second;
+                                
+                                if (is_positive && !relaxed_state.is_true(fact_id)) {
+                                    relaxed_state.known_mask[fact_id / 64] |= (1ULL << (fact_id % 64));
+                                    relaxed_state.value_mask[fact_id / 64] |= (1ULL << (fact_id % 64));
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return true;
     }
     
 public:
@@ -462,35 +507,23 @@ public:
     }
 
     bool solve_from_node(int node_idx, std::vector<int>& current_path_indices) {
-        // Access state by value copy to avoid holding references to node_pool
-        PartiallySpecifiedState current_state = node_pool[node_idx].state;
+        PartiallySpecifiedState& current_state = node_pool[node_idx].state;
 
-        // Goal Check
+        // Check cache to avoid duplicate work
+        if (solved_cache.find(current_state) != solved_cache.end()) return true;
+        if (failed_cache.find(current_state) != failed_cache.end()) return false;
+
+        // Evaluate goal
         if (Evaluator::evaluate_rpn(global_problem.goal_rpn, current_state) == VAL_TRUE) {
             node_pool[node_idx].is_solved = true;
+            solved_cache[current_state] = node_idx;
             return true;
         }
 
-        if (failed_cache.count(current_state)) return false;
-
-        // DEAD-END EVALUATION
-        for (const auto& deadend_rpn : global_problem.deadend_rpns) {
-            // A dead-end is only triggered if we definitively know it has been breached
-            if (Evaluator::evaluate_rpn(deadend_rpn, current_state) == VAL_TRUE) {
-                failed_cache.insert(current_state); // Poison this state globally
-                return false;
-            }
-        }
-
-        // Solved Cache Check
-        if (solved_cache.count(current_state)) {
-            int cached_idx = solved_cache[current_state];
-            node_pool[node_idx].is_solved = true;
-            node_pool[node_idx].chosen_action_id = node_pool[cached_idx].chosen_action_id;
-            node_pool[node_idx].single_child_idx = node_pool[cached_idx].single_child_idx;
-            node_pool[node_idx].true_child_idx = node_pool[cached_idx].true_child_idx;
-            node_pool[node_idx].false_child_idx = node_pool[cached_idx].false_child_idx;
-            return true; 
+        // Prune mathematical dead ends early
+        if (is_dead_end(current_state)) {
+            failed_cache.insert(current_state);
+            return false;
         }
 
         current_path_indices.push_back(node_idx);
@@ -625,7 +658,6 @@ public:
         if (!failed_due_to_loop) {
             failed_cache.insert(current_state); 
         }
-        
         
         return false; 
     }

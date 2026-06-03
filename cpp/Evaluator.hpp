@@ -12,7 +12,7 @@ constexpr int OP_EQUALS = -5;
 constexpr int OP_TRUE = -6;
 constexpr int OP_FALSE = -7;
 
-// The 3 Valued Logic State Constants (Used for stack results, NOT RPN tokens)
+// The 3 Valued Logic State Constants 
 constexpr uint8_t VAL_FALSE = 0;
 constexpr uint8_t VAL_TRUE = 1;
 constexpr uint8_t VAL_UNKNOWN = 2;
@@ -30,7 +30,7 @@ public:
             int token = rpn[i];
 
             if (sp >= 255) {
-                throw std::runtime_error("RPN stack overflow: Formula too complex for 256-byte stack.");
+                throw std::runtime_error("RPN stack overflow Formula too complex for 256 byte stack.");
             }
 
             if (token >= 0) {
@@ -48,50 +48,32 @@ public:
                     stack[sp++] = VAL_FALSE;
                 }
                 else if (token == OP_NOT) {
+                    if (sp < 1) throw std::runtime_error("RPN stack underflow on OP NOT");
                     uint8_t val = stack[sp - 1];
                     if (val == VAL_TRUE) stack[sp - 1] = VAL_FALSE;
                     else if (val == VAL_FALSE) stack[sp - 1] = VAL_TRUE;
                     else stack[sp - 1] = VAL_UNKNOWN;
                 } 
                 else if (token == OP_AND) {
+                    if (sp < 2) throw std::runtime_error("RPN stack underflow on OP AND");
                     uint8_t right = stack[--sp];
                     uint8_t left = stack[sp - 1];
 
                     if (left == VAL_FALSE || right == VAL_FALSE) stack[sp - 1] = VAL_FALSE;
                     else if (left == VAL_TRUE && right == VAL_TRUE) stack[sp - 1] = VAL_TRUE;
                     else stack[sp - 1] = VAL_UNKNOWN;
-
-                    if (sp == 1 && stack[0] == VAL_FALSE) {
-                        bool salvage_possible = false;
-                        for (size_t j = i + 1; j < rpn_size; ++j) {
-                            if (rpn[j] == OP_OR || rpn[j] == OP_NOT) {
-                                salvage_possible = true;
-                                break;
-                            }
-                        }
-                        if (!salvage_possible) return VAL_FALSE;
-                    }
                 } 
                 else if (token == OP_OR) {
+                    if (sp < 2) throw std::runtime_error("RPN stack underflow on OP OR");
                     uint8_t right = stack[--sp];
                     uint8_t left = stack[sp - 1];
 
                     if (left == VAL_TRUE || right == VAL_TRUE) stack[sp - 1] = VAL_TRUE;
                     else if (left == VAL_FALSE && right == VAL_FALSE) stack[sp - 1] = VAL_FALSE;
                     else stack[sp - 1] = VAL_UNKNOWN;
-
-                    if (sp == 1 && stack[0] == VAL_TRUE) {
-                        bool break_possible = false;
-                        for (size_t j = i + 1; j < rpn_size; ++j) {
-                            if (rpn[j] == OP_AND || rpn[j] == OP_NOT) {
-                                break_possible = true;
-                                break;
-                            }
-                        }
-                        if (!break_possible) return VAL_TRUE;
-                    }
                 }
                 else if (token == OP_EQUALS) {
+                    if (sp < 2) throw std::runtime_error("RPN stack underflow on OP EQUALS");
                     uint8_t right = stack[--sp];
                     uint8_t left = stack[sp - 1];
                     
@@ -101,6 +83,7 @@ public:
             }
         }
         
+        if (sp < 1) throw std::runtime_error("RPN evaluation failed empty stack");
         return stack[0];
     }
 };
