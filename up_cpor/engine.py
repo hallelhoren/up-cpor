@@ -15,7 +15,7 @@ from unified_planning.plans.contingent_plan import ContingentPlanNode
 
 from typing import Type, IO, Optional, Callable, Dict
 import warnings
-from up_cpor.converter import CporPlanGraphError, UpCporConverter
+from up_cpor.problem_flattener import CporPlanGraphError, UpCporConverter
 
 
 def _is_empty_observation(observation) -> bool:
