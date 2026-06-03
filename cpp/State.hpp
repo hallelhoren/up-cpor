@@ -87,7 +87,7 @@ struct StateHasher {
 
         for (size_t i = 0; i < s.known_mask.size(); ++i) {
             uint64_t k_block = s.known_mask[i] & global_problem.comparable_mask[i];
-            uint64_t v_block = s.value_mask[i] & global_problem.comparable_mask[i];
+            uint64_t v_block = s.value_mask[i] & s.known_mask[i] & global_problem.comparable_mask[i];
             
             hash ^= k_block;
             hash *= 1099511628211ULL; // FNV prime
