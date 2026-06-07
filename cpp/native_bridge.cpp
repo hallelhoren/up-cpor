@@ -30,64 +30,34 @@ extern "C" {
     }
 
     // Renamed legacy function to populate guaranteed effects
-    void add_action(int id, int cost, int* pre_rpn, int pre_len, int* eff_ids, bool* eff_vals, int eff_len, int obs_id) {
-        GroundedAction act;
+    void create_action(int id, int cost, int* pre_rpn, int pre_len, int obs_id) {
+        // Ensure vector capacity to prevent out-of-bounds segfaults
+        if (global_problem.actions.size() <= static_cast<size_t>(id)) {
+            global_problem.actions.resize(id + 1);
+        }
+        
+        auto& act = global_problem.actions[id];
         act.id = id;
-        act.cost = cost; 
-        
-        // Allocate the bitset mask to exactly match the state dimension size
-        int blocks = (global_problem.total_predicates / 64) + 1;
-        act.fast_precondition_mask.assign(blocks, 0ULL);
-        bool is_complex = false;
-
-        if (pre_len > 0) {
-            act.precondition_rpn.assign(pre_rpn, pre_rpn + pre_len);
-            
-            // PRE-COMPILATION: Analyze the RPN string. 
-            // If it only contains positive facts and OP_AND (-1), it is a pure STRIPS action.
-            for (int i = 0; i < pre_len; ++i) {
-                int token = pre_rpn[i];
-                if (token >= 0) {
-                    act.fast_precondition_mask[token / 64] |= (1ULL << (token % 64));
-                } else if (token != -1) { // -1 is OP_AND in Evaluator.hpp
-                    is_complex = true; // Contains OR, NOT, ONEOF, etc.
-                }
-            }
-        }
-        
-        act.has_complex_precondition = is_complex;
-
-        for(int i = 0; i < eff_len; ++i) {
-            act.guaranteed_effects.push_back({eff_ids[i], eff_vals[i]});
-        }
-        
+        act.cost = cost;
+        act.precondition_rpn.assign(pre_rpn, pre_rpn + pre_len);
         act.observe_predicate_id = obs_id;
-        global_problem.actions.push_back(std::move(act));
     }
 
-    //Attach a conditional effect to an existing action
-    void add_conditional_effect(int action_id, int* cond_rpn, int cond_len, int* eff_ids, bool* eff_vals, int eff_len) {
-        for (auto& act : global_problem.actions) {
-            if (act.id == action_id) {
-                ConditionalEffect ce;
-                ce.condition_rpn.assign(cond_rpn, cond_rpn + cond_len);
-                for(int i = 0; i < eff_len; ++i) {
-                    ce.effects.push_back({eff_ids[i], eff_vals[i]});
-                }
-                act.conditional_effects.push_back(std::move(ce));
-                return;
-            }
-        }
+    void add_guaranteed_effect(int action_id, int fluent_id, bool val) {
+        global_problem.actions[action_id].guaranteed_effects.push_back({fluent_id, val});
     }
 
-    //Attach a non-deterministic target to an existing action
-    void add_non_deterministic_effect(int action_id, int fact_id) {
-        for (auto& act : global_problem.actions) {
-            if (act.id == action_id) {
-                act.non_deterministic_effects.push_back(fact_id);
-                return;
-            }
-        }
+    void add_conditional_effect(int action_id, int* cond_rpn, int cond_len, int fluent_id, bool val) {
+        // Creates a localized RPN block strictly tied to this specific fluent assignment
+        ConditionalEffect ce;
+        ce.condition_rpn.assign(cond_rpn, cond_rpn + cond_len);
+        ce.effects.push_back({fluent_id, val});
+        
+        global_problem.actions[action_id].conditional_effects.push_back(ce);
+    }
+
+    void add_nondeterministic_effect(int action_id, int fluent_id) {
+        global_problem.actions[action_id].non_deterministic_effects.push_back(fluent_id);
     }
 
     void add_oneof_constraint(int* ids_array, int length) {
@@ -103,8 +73,8 @@ extern "C" {
         }
     }
 
-    void add_initial_unknown_fact(int fact_id) {
-        global_problem.initial_unknown_facts.push_back(fact_id);
+    void add_initial_false_fact(int fact_id) {
+        global_problem.initial_false_facts.push_back(fact_id);
     }
 
     void print_problem_stats() {
@@ -129,22 +99,17 @@ extern "C" {
         
         PartiallySpecifiedState initial_state(global_problem.total_predicates, global_problem.total_functions);
         
-        // 1. CLOSED WORLD FALLBACK: Set everything to False initially
-        for (int i = 0; i < global_problem.total_predicates; i++) {
-            initial_state.set_known_value(i, false);
-        }
-
-        // 2. EXPLICITLY TRUE FACTS
+        // 1. EXPLICITLY TRUE FACTS
         for (int fact_id : global_problem.initial_true_facts) {
             initial_state.set_known_value(fact_id, true);
         }
 
-        // 3. ISOLATED UNKNOWN FACTS (NEW: Open World Assumption override)
-        for (int fact_id : global_problem.initial_unknown_facts) {
-            initial_state.set_unknown(fact_id);
+        // 2. EXPLICITLY FALSE FACTS
+        for (int fact_id : global_problem.initial_false_facts) {
+            initial_state.set_known_value(fact_id, false);
         }
 
-        // 4. ONEOF CONSTRAINTS (Also sets facts to unknown, pending deductions)
+        // 3. ONEOF CONSTRAINTS (Also sets facts to unknown, pending deductions)
         for (const auto& group : global_problem.oneofs) {
             for (int fact_id : group) {
                 initial_state.set_unknown(fact_id);
@@ -161,9 +126,13 @@ extern "C" {
         }
 
         int root_idx = global_solver->create_root_node(initial_state);
-        std::unordered_set<PartiallySpecifiedState, StateHasher> visited;
+        
+        // Pass a lightweight vector of node indices for cycle tracking
+        std::vector<int> current_path_indices;
+        // Preallocate reasonable depth to prevent vector resizing mid-search
+        current_path_indices.reserve(1024); 
 
-        bool success = global_solver->solve_from_node(root_idx, visited);
+        bool success = global_solver->solve_from_node(root_idx, current_path_indices);
 
         if (success) {
             std::cout << ">>> SUCCESS: Contingent Plan Found! <<<" << std::endl;
@@ -188,5 +157,48 @@ extern "C" {
     
     int get_false_child(int node_idx) { 
         return global_solver->get_node(node_idx).false_child_idx; 
+    }
+
+    //DEBUGGING FUNCTION TO VERIFY PROBLEM LOADING
+    // Validation interface for Python testing
+    // Returns 1 for True, 0 for False, and -1 for Unknown
+    int check_initial_state_fluent(int fluent_id) {
+        PartiallySpecifiedState initial_state(global_problem.total_predicates, global_problem.total_functions);
+        
+        for (int id : global_problem.initial_true_facts) {
+            initial_state.known_mask[id / 64] |= (1ULL << (id % 64));
+            initial_state.value_mask[id / 64] |= (1ULL << (id % 64));
+        }
+        
+        for (int id : global_problem.initial_false_facts) {
+            initial_state.known_mask[id / 64] |= (1ULL << (id % 64));
+            initial_state.value_mask[id / 64] &= ~(1ULL << (id % 64));
+        }
+
+        if (initial_state.is_true(fluent_id)) return 1;
+        if (initial_state.is_false(fluent_id)) return 0;
+        
+        // Represents mathematical Open World ignorance
+        return -1; 
+    }
+
+    int get_action_precondition_len(int action_id) {
+        if (action_id >= global_problem.actions.size()) return -1;
+        return global_problem.actions[action_id].precondition_rpn.size();
+    }
+
+    int get_action_guaranteed_effect_count(int action_id) {
+        if (action_id >= global_problem.actions.size()) return -1;
+        return global_problem.actions[action_id].guaranteed_effects.size();
+    }
+
+    int get_action_conditional_effect_count(int action_id) {
+        if (action_id >= global_problem.actions.size()) return -1;
+        return global_problem.actions[action_id].conditional_effects.size();
+    }
+
+    int get_action_observe_id(int action_id) {
+        if (action_id >= global_problem.actions.size()) return -1;
+        return global_problem.actions[action_id].observe_predicate_id;
     }
 } // End of extern "C"

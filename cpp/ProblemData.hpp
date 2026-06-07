@@ -42,7 +42,6 @@ struct GroundedAction {
     std::vector<int> precondition_rpn{};
 
     std::vector<uint64_t> fast_precondition_mask{};
-    bool has_complex_precondition{false};
 
     /** * @brief The effects of the action, represented as a list of (predicate_id, new_truth_value).
      * * Using flat integer pairs eliminates the need for allocating `Predicate` objects on the heap.
@@ -76,7 +75,7 @@ struct ProblemDef {
      */
     std::vector<int> initial_true_facts{};
 
-    std::vector<int> initial_unknown_facts{};
+    std::vector<int> initial_false_facts{};
 
     /** * @brief Flattened RPN array representing the goal formula. 
      */

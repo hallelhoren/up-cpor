@@ -2,6 +2,10 @@
 #include <vector>
 #include <cstdint>
 #include <functional>
+#include <cstring>
+#include "ProblemData.hpp"
+
+extern ProblemDef global_problem;
 
 /**
  * @class PartiallySpecifiedState
@@ -17,17 +21,13 @@ public:
     PartiallySpecifiedState() = default;
 
     // Constructor: sizes the bitset based on Total Predicates (N)
-    PartiallySpecifiedState(int total_predicates, int total_functions) {
+    PartiallySpecifiedState(int total_predicates, int total_functions = 0) {
         int blocks = (total_predicates / 64) + 1;
-        known_mask.assign(blocks, ~0ULL); 
+
+        known_mask.assign(blocks, 0ULL); 
         value_mask.assign(blocks, 0ULL);
         function_values.assign(total_functions, 0.0);
 
-        int remainder = total_predicates % 64;
-        if (remainder != 0) {
-            uint64_t valid_bits_mask = (1ULL << remainder) - 1;
-            known_mask.back() &= valid_bits_mask;
-        }
     }
 
     // Mathematical State Evaluation
@@ -35,6 +35,12 @@ public:
         // True IF it is known AND its value is 1
         return (known_mask[id / 64] & (1ULL << (id % 64))) && 
                (value_mask[id / 64] & (1ULL << (id % 64)));
+    }
+
+    //Explicit FALSE evaluation. Must be KNOWN and VALUE == 0.
+    bool is_false(int id) const {
+        uint64_t bit = 1ULL << (id % 64);
+        return (known_mask[id / 64] & bit) && !(value_mask[id / 64] & bit);
     }
 
     bool is_unknown(int id) const {
@@ -72,9 +78,13 @@ public:
 
     // Forces a fact into the UNKNOWN state (used for Knowledge Loss and Non-Determinism)
     void set_unknown(int id) {
-        known_mask[id / 64] &= ~(1ULL << (id % 64)); // Clear the known bit (0)
-        // Note: The value_mask bit no longer matters because is_true checks the known_mask first
-    }
+    uint64_t bit = 1ULL << (id % 64);
+    
+    // Canonicalize state to prevent SIMD/bitwise corruption 
+    // during bulk action application in later phases.
+    known_mask[id / 64] &= ~bit; 
+    value_mask[id / 64] &= ~bit; 
+}
 };
 
 /**
