@@ -14,6 +14,20 @@
  * during state evaluation.
  */
 
+ // Defines arithmetic operations for numeric effects
+enum class NumericOp { 
+    ASSIGN = 0, 
+    INCREASE = 1, 
+    DECREASE = 2 
+};
+
+// Represents a modification to a numeric function
+struct NumericEffect {
+    int function_id;
+    NumericOp op;
+    double value;
+};
+
  struct ConditionalEffect {
     std::vector<int> condition_rpn;
     std::vector<std::pair<int, bool>> effects;
@@ -49,6 +63,8 @@ struct GroundedAction {
     // Split into guaranteed, conditional, and non-deterministic
     std::vector<std::pair<int, bool>> guaranteed_effects{};
     std::vector<ConditionalEffect> conditional_effects{};
+
+    std::vector<NumericEffect> numeric_effects{};
     std::vector<int> non_deterministic_effects{}; // List of fact IDs that become UNKNOWN
 
     /** * @brief ID of the observed predicate for sensing actions. 
@@ -76,6 +92,8 @@ struct ProblemDef {
     std::vector<int> initial_true_facts{};
 
     std::vector<int> initial_false_facts{};
+
+    std::vector<std::pair<int, double>> initial_function_values{};
 
     /** * @brief Flattened RPN array representing the goal formula. 
      */

@@ -25,6 +25,11 @@ extern "C" {
         global_problem.initial_true_facts.push_back(fact_id);
     }
 
+    void add_initial_function_value(int func_id, double value) {
+        // We store it as a pair to be applied during state construction
+        global_problem.initial_function_values.push_back({func_id, value});
+    }
+
     void set_goal_rpn(int* rpn_array, int length) {
         global_problem.goal_rpn.assign(rpn_array, rpn_array + length);
     }

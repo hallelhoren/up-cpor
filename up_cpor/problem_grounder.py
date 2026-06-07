@@ -31,6 +31,7 @@ try:
     cpor_lib.init_problem.argtypes = [ctypes.c_int, ctypes.c_int]
     cpor_lib.add_initial_fact.argtypes = [ctypes.c_int]
     cpor_lib.add_initial_false_fact.argtypes = [ctypes.c_int]
+    cpor_lib.add_initial_function_value.argtypes = [ctypes.c_int, ctypes.c_double]
     cpor_lib.set_goal_rpn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     cpor_lib.create_action.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int
@@ -62,7 +63,12 @@ class UpCporConverter:
         self.id_to_fluent: Dict[int, str] = {}
         self.action_id_to_up_action: Dict[int, ActionInstance] = {}
         self.next_id = 0
-        # CRITICAL: Persistent memory references to protect ctypes pointers from the Python Garbage Collector.
+
+        self.function_to_id: Dict[str, int] = {}
+        self.id_to_function: Dict[int, str] = {}
+        self.next_func_id = 0
+
+        self.action_id_to_up_action: Dict[int, ActionInstance] = {}
         self._c_memory_refs: List[ctypes.Array] = []
 
     def generate_native_problem(self, original_problem: up.model.Problem):
@@ -70,7 +76,7 @@ class UpCporConverter:
         substituter = Substituter(original_problem.environment)
 
         self._build_fluent_dict(original_problem, em)
-        cpor_lib.init_problem(len(self.fluent_to_id),0)
+        cpor_lib.init_problem(len(self.fluent_to_id),len(self.function_to_id))
 
         explicitly_known = set()
         for init_node, value in original_problem.initial_values.items():
@@ -82,6 +88,12 @@ class UpCporConverter:
                     explicitly_known.add(fluent_str)
                 elif value.is_false():
                     cpor_lib.add_initial_false_fact(fluent_id)
+                    explicitly_known.add(fluent_str)
+            
+            func_id = self.function_to_id.get(fluent_str)
+            if func_id is not None:
+                if value.is_int_constant() or value.is_real_constant():
+                    cpor_lib.add_initial_function_value(func_id, ctypes.c_double(value.constant_value()))
                     explicitly_known.add(fluent_str)
 
         combined_goal_rpn = []
@@ -184,12 +196,24 @@ class UpCporConverter:
             param_lists = [list(problem.objects(p.type)) for p in fluent.signature]
             if not param_lists:
                 fluent_node = em.FluentExp(fluent)
-                self._add_fluent_to_dict(str(fluent_node))
+                self._route_fluent_by_type(fluent, str(fluent_node))
             else:
                 for combo in itertools.product(*param_lists):
                     obj_args = tuple(em.ObjectExp(obj) for obj in combo)
                     fluent_node = em.FluentExp(fluent, obj_args)
-                    self._add_fluent_to_dict(str(fluent_node))
+                    self._route_fluent_by_type(fluent, str(fluent_node))
+
+    def _route_fluent_by_type(self, fluent, fluent_str: str):
+        if fluent.type.is_bool_type():
+            if fluent_str not in self.fluent_to_id:
+                self.fluent_to_id[fluent_str] = self.next_id
+                self.id_to_fluent[self.next_id] = fluent_str
+                self.next_id += 1
+        elif fluent.type.is_int_type() or fluent.type.is_real_type():
+            if fluent_str not in self.function_to_id:
+                self.function_to_id[fluent_str] = self.next_func_id
+                self.id_to_function[self.next_func_id] = fluent_str
+                self.next_func_id += 1
 
     def _add_fluent_to_dict(self, fluent_str: str):
         if fluent_str not in self.fluent_to_id:

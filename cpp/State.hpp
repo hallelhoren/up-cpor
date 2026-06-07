@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <cstring>
+#include <limits>
 #include "ProblemData.hpp"
 
 extern ProblemDef global_problem;
@@ -16,6 +17,7 @@ class PartiallySpecifiedState {
 public:
     std::vector<uint64_t> known_mask; 
     std::vector<uint64_t> value_mask;
+    std::vector<uint64_t> known_function_mask;
     std::vector<double> function_values;
 
     PartiallySpecifiedState() = default;
@@ -23,11 +25,48 @@ public:
     // Constructor: sizes the bitset based on Total Predicates (N)
     PartiallySpecifiedState(int total_predicates, int total_functions = 0) {
         int blocks = (total_predicates / 64) + 1;
-
         known_mask.assign(blocks, 0ULL); 
         value_mask.assign(blocks, 0ULL);
+
+        int func_blocks = (total_functions / 64) + 1;
+        known_function_mask.assign(func_blocks, 0ULL);
         function_values.assign(total_functions, 0.0);
 
+    }
+
+    void set_function_value(int id, double val) {
+        known_function_mask[id / 64] |= (1ULL << (id % 64));
+        function_values[id] = val;
+    }
+
+    // Safely reads a function value
+    // Returns NaN if the agent does not possess the knowledge
+    double get_function_value(int id) const {
+        if (known_function_mask[id / 64] & (1ULL << (id % 64))) {
+            return function_values[id];
+        }
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    // Applies an arithmetic operation strictly adhering to Three Valued Logic
+    void apply_numeric_effect(const NumericEffect& eff) {
+        uint64_t bit = 1ULL << (eff.function_id % 64);
+        bool is_known = known_function_mask[eff.function_id / 64] & bit;
+
+        // Any arithmetic performed on an unknown value results in an unknown value
+        if (!is_known && eff.op != NumericOp::ASSIGN) {
+            return; 
+        }
+
+        if (eff.op == NumericOp::ASSIGN) {
+            set_function_value(eff.function_id, eff.value);
+        } 
+        else if (eff.op == NumericOp::INCREASE) {
+            function_values[eff.function_id] += eff.value;
+        } 
+        else if (eff.op == NumericOp::DECREASE) {
+            function_values[eff.function_id] -= eff.value;
+        }
     }
 
     // Mathematical State Evaluation
