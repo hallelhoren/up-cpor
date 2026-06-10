@@ -76,8 +76,11 @@ class UpCporConverter:
         substituter = Substituter(original_problem.environment)
 
         self._build_fluent_dict(original_problem, em)
-        cpor_lib.init_problem(len(self.fluent_to_id),len(self.function_to_id))
+        cpor_lib.init_problem(len(self.fluent_to_id), len(self.function_to_id))
 
+        # ===================================================================
+        # PHASE 1: Load Initial Explicit State into C++
+        # ===================================================================
         explicitly_known = set()
         for init_node, value in original_problem.initial_values.items():
             fluent_str = str(init_node)
@@ -96,6 +99,9 @@ class UpCporConverter:
                     cpor_lib.add_initial_function_value(func_id, ctypes.c_double(value.constant_value()))
                     explicitly_known.add(fluent_str)
 
+        # ===================================================================
+        # PHASE 2: Load Goals
+        # ===================================================================
         combined_goal_rpn = []
         for i, g in enumerate(original_problem.goals):
             combined_goal_rpn.extend(self._compile_to_rpn(g))
@@ -106,73 +112,123 @@ class UpCporConverter:
             self._c_memory_refs.append(c_goal_arr)
             cpor_lib.set_goal_rpn(c_goal_arr, len(combined_goal_rpn))
 
+        # ===================================================================
+        # PHASE 3: Optimistic Reachability Filter (The AST Bouncer)
+        # ===================================================================
+        reachable_facts = set(explicitly_known) # Seed with known truths
+        
+        # Seed with Open-World possibilities (OneOf constraints)
+        if hasattr(original_problem, 'oneof_constraints'):
+            for group in original_problem.oneof_constraints:
+                for f in group:
+                    reachable_facts.add(str(f))
+
+        reachable_actions = []
+        reachable_action_signatures = set() # O(1) lookup to prevent duplicates
+        facts_changed = True
+
+        # Fixed-Point Iteration Loop
+        while facts_changed:
+            facts_changed = False
+            
+            for action in original_problem.actions:
+                param_lists = [list(original_problem.objects(p.type)) for p in action.parameters]
+
+                for combo in itertools.product(*param_lists):
+                    signature = (action.name, combo)
+                    if signature in reachable_action_signatures:
+                        continue 
+                    
+                    subs = {p: em.ObjectExp(obj) for p, obj in zip(action.parameters, combo)}
+                    
+                    # Evaluate AST against current reachable facts
+                    is_reachable = True
+                    for p in action.preconditions:
+                        grounded_p = substituter.substitute(p, subs)
+                        if not self._is_formula_satisfiable(grounded_p, reachable_facts):
+                            is_reachable = False
+                            break
+                    
+                    # If action is physically possible, keep it and learn its effects
+                    if is_reachable:
+                        reachable_actions.append((action, subs))
+                        reachable_action_signatures.add(signature)
+                        
+                        # Expand the universe of possible facts
+                        for eff in action.effects:
+                            cond_grounded = substituter.substitute(eff.condition, subs)
+                            if eff.value.is_true() and cond_grounded.is_true():
+                                fluent_str = str(substituter.substitute(eff.fluent, subs))
+                                if fluent_str not in reachable_facts:
+                                    reachable_facts.add(fluent_str)
+                                    facts_changed = True
+                                    
+                        # Sensing an object adds it to our known universe
+                        if hasattr(action, 'observed_fluents') and action.observed_fluents:
+                            obs_str = str(substituter.substitute(action.observed_fluents[0], subs))
+                            if obs_str not in reachable_facts:
+                                reachable_facts.add(obs_str)
+                                facts_changed = True
+
+        # ===================================================================
+        # PHASE 4: Compile Survivors to RPN & Dispatch to C++ Engine
+        # ===================================================================
         action_idx = 0
-        for action in original_problem.actions:
-            param_lists = [list(original_problem.objects(p.type)) for p in action.parameters]
+        for action, subs in reachable_actions:
+            self.action_id_to_up_action[action_idx] = action
 
-            for combo in itertools.product(*param_lists):
-                subs = {p: em.ObjectExp(obj) for p, obj in zip(action.parameters, combo)}
-                self.action_id_to_up_action[action_idx] = action
+            pre_rpn = []
+            for i, p in enumerate(action.preconditions):
+                grounded_p = substituter.substitute(p, subs)
+                pre_rpn.extend(self._compile_to_rpn(grounded_p))
+                if i > 0: pre_rpn.append(OP_AND)
 
-                # 1. Compile Preconditions
-                pre_rpn = []
-                for i, p in enumerate(action.preconditions):
-                    grounded_p = substituter.substitute(p, subs)
-                    pre_rpn.extend(self._compile_to_rpn(grounded_p))
-                    if i > 0: pre_rpn.append(OP_AND)
+            obs_id = -1
+            if hasattr(action, 'observed_fluents') and action.observed_fluents:
+                fluent_str = str(substituter.substitute(action.observed_fluents[0], subs))
+                if fluent_str in self.fluent_to_id:
+                    obs_id = self.fluent_to_id[fluent_str]
 
-                # 2. Extract Observation Targets
-                obs_id = -1
-                if hasattr(action, 'observed_fluents') and action.observed_fluents:
-                    fluent_str = str(substituter.substitute(action.observed_fluents[0], subs))
+            action_cost = 1
+            if hasattr(original_problem, 'quality_metrics'):
+                for metric in original_problem.quality_metrics:
+                    if isinstance(metric, up.model.metrics.MinimizeActionCosts):
+                        cost_expr = metric.get_action_cost(action)
+                        if cost_expr is not None and cost_expr.is_int_constant():
+                            action_cost = cost_expr.constant_value()
+
+            c_pre = (ctypes.c_int * len(pre_rpn))(*pre_rpn)
+            self._c_memory_refs.append(c_pre)
+            cpor_lib.create_action(action_idx, action_cost, c_pre, len(pre_rpn), obs_id)
+
+            for eff in action.effects:
+                fluent_str = str(substituter.substitute(eff.fluent, subs))
+                if fluent_str not in self.fluent_to_id:
+                    continue
+                fluent_id = self.fluent_to_id[fluent_str]
+                val = eff.value.is_true()
+                
+                cond_grounded = substituter.substitute(eff.condition, subs)
+                
+                if cond_grounded.is_true():
+                    cpor_lib.add_guaranteed_effect(action_idx, fluent_id, val)
+                else:
+                    cond_rpn = self._compile_to_rpn(cond_grounded)
+                    c_cond = (ctypes.c_int * len(cond_rpn))(*cond_rpn)
+                    self._c_memory_refs.append(c_cond)
+                    cpor_lib.add_conditional_effect(action_idx, c_cond, len(cond_rpn), fluent_id, val)
+
+            if hasattr(action, 'non_deterministic_effects'):
+                for nd_eff in action.non_deterministic_effects:
+                    fluent_str = str(substituter.substitute(nd_eff, subs))
                     if fluent_str in self.fluent_to_id:
-                        obs_id = self.fluent_to_id[fluent_str]
+                        cpor_lib.add_nondeterministic_effect(action_idx, self.fluent_to_id[fluent_str])
 
-                # 3. Calculate Cost
-                action_cost = 1
-                if hasattr(original_problem, 'quality_metrics'):
-                    for metric in original_problem.quality_metrics:
-                        if isinstance(metric, up.model.metrics.MinimizeActionCosts):
-                            cost_expr = metric.get_action_cost(action)
-                            if cost_expr is not None and cost_expr.is_int_constant():
-                                action_cost = cost_expr.constant_value()
+            action_idx += 1
 
-                # 4. Instantiate Base Action in C++ Memory
-                c_pre = (ctypes.c_int * len(pre_rpn))(*pre_rpn)
-                self._c_memory_refs.append(c_pre)
-                cpor_lib.create_action(action_idx, action_cost, c_pre, len(pre_rpn), obs_id)
-
-                # 5. Route Effects (Guaranteed vs. Conditional)
-                for eff in action.effects:
-                    fluent_str = str(substituter.substitute(eff.fluent, subs))
-                    if fluent_str not in self.fluent_to_id:
-                        continue
-                    fluent_id = self.fluent_to_id[fluent_str]
-                    val = eff.value.is_true()
-                    
-                    # UP stores the condition of an effect in eff.condition
-                    cond_grounded = substituter.substitute(eff.condition, subs)
-                    
-                    if cond_grounded.is_true():
-                        # Strict Deterministic Effect
-                        cpor_lib.add_guaranteed_effect(action_idx, fluent_id, val)
-                    else:
-                        # Conditional Effect (WHEN Clause)
-                        cond_rpn = self._compile_to_rpn(cond_grounded)
-                        c_cond = (ctypes.c_int * len(cond_rpn))(*cond_rpn)
-                        self._c_memory_refs.append(c_cond)
-                        cpor_lib.add_conditional_effect(action_idx, c_cond, len(cond_rpn), fluent_id, val)
-
-                # 6. Route Non-Deterministic Effects (If present in domain spec)
-                # (Assuming you expand your grounder to handle NonDeterministicAction types)
-                if hasattr(action, 'non_deterministic_effects'):
-                    for nd_eff in action.non_deterministic_effects:
-                        fluent_str = str(substituter.substitute(nd_eff, subs))
-                        if fluent_str in self.fluent_to_id:
-                            cpor_lib.add_nondeterministic_effect(action_idx, self.fluent_to_id[fluent_str])
-
-                action_idx += 1
-
+        # ===================================================================
+        # PHASE 5: Load Constraints & Dead Ends
+        # ===================================================================
         if hasattr(original_problem, 'oneof_constraints'):
             for oneof_group in original_problem.oneof_constraints:
                 group_ids = [self.fluent_to_id[str(f)] for f in oneof_group if str(f) in self.fluent_to_id]
@@ -190,6 +246,47 @@ class UpCporConverter:
                     cpor_lib.add_deadend_rpn(c_rpn_array, len(rpn_list))
 
         cpor_lib.print_problem_stats()
+
+    def _is_formula_satisfiable(self, node: FNode, reachable_facts: set) -> bool:
+        """
+        Checks if a logical formula (FNode) can potentially be satisfied
+        given our current set of reachable facts.
+        """
+        # 1. Base Constants
+        if node.is_true(): return True
+        if node.is_false(): return False
+
+        # 2. We hit a Leaf (A Fluent Fact)
+        # e.g., node represents "At(Rover1, WaypointA)"
+        if node.is_fluent_exp():
+            fluent_str = str(node)
+            # Is this specific string in our bucket of possible facts?
+            return fluent_str in reachable_facts
+
+        # 3. It's an AND condition (All children must be reachable)
+        if node.is_and():
+            for arg in node.args:
+                if not self._is_formula_satisfiable(arg, reachable_facts):
+                    return False  # If even one part is unreachable, the whole AND fails
+            return True
+
+        # 4. It's an OR condition (At least one child must be reachable)
+        if node.is_or():
+            for arg in node.args:
+                if self._is_formula_satisfiable(arg, reachable_facts):
+                    return True   # One success is enough for an OR
+            return False
+
+        # 5. It's a NOT condition (Negative preconditions)
+        # Under standard "Delete Relaxation" rules for reachability graphs, 
+        # we optimistically assume negative conditions can always be met.
+        if node.is_not():
+            return True
+            
+        # 6. Fallback (Implies, Iff, etc.)
+        # In Optimistic Reachability, if we hit a weird logical operator, 
+        # we assume it's True so we don't accidentally delete a valid action.
+        return True
 
     def _build_fluent_dict(self, problem: up.model.Problem, em):
         for fluent in problem.fluents:

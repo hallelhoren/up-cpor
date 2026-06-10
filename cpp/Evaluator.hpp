@@ -69,11 +69,11 @@ public:
                     if (left == VAL_UNKNOWN || right == VAL_UNKNOWN) stack[sp - 1] = VAL_UNKNOWN;
                     else stack[sp - 1] = (left == right) ? VAL_TRUE : VAL_FALSE;
                 }
-                else if (token == OP_ONEOF) {
+                /*else if (token == OP_ONEOF) {
                     // Exact XOR: True if exactly one is true and the other is false.
                     if (left == VAL_UNKNOWN || right == VAL_UNKNOWN) stack[sp - 1] = VAL_UNKNOWN;
                     else stack[sp - 1] = (left != right) ? VAL_TRUE : VAL_FALSE;
-                }
+                }*/
             }
         }
         if (sp != 1) throw std::runtime_error("RPN evaluation left multiple items on stack");
@@ -88,3 +88,4 @@ public:
         return false; // Should not reach if EXACT is handled manually
     }
 };
+

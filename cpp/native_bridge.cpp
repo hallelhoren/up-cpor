@@ -132,8 +132,8 @@ extern "C" {
 
         int root_idx = global_solver->create_root_node(initial_state);
         
-        // Pass a lightweight vector of node indices for cycle tracking
-        std::vector<int> current_path_indices;
+        // Pass an initially empty set to track the current search path for cycle detection
+        std::unordered_set<PartiallySpecifiedState, StateHasher> current_path_indices;
         // Preallocate reasonable depth to prevent vector resizing mid-search
         current_path_indices.reserve(1024); 
 

@@ -124,6 +124,56 @@ public:
     known_mask[id / 64] &= ~bit; 
     value_mask[id / 64] &= ~bit; 
 }
+
+    // Applies SDR Logical Deduction across all OneOf constraints
+    // Returns false if a logical contradiction is found (dead-end state)
+    bool apply_oneof_deductions(const std::vector<std::vector<int>>& oneof_groups) {
+        bool state_changed = true;
+        
+        // Loop until epistemic equilibrium is reached (no new deductions)
+        while (state_changed) {
+            state_changed = false;
+            
+            for (const auto& group : oneof_groups) {
+                int true_count = 0;
+                int unknown_count = 0;
+                int last_unknown_id = -1;
+
+                // 1. Scan the current knowledge of the group
+                for (int id : group) {
+                    if (is_true(id)) {
+                        true_count++;
+                    } else if (is_unknown(id)) {
+                        unknown_count++;
+                        last_unknown_id = id;
+                    }
+                }
+
+                // 2. Contradiction Detection
+                if (true_count > 1) {
+                    return false; // Mathematical impossibility, prune this state
+                }
+
+                // 3. Forward Deduction: If ONE is true, all others MUST be false
+                if (true_count == 1 && unknown_count > 0) {
+                    for (int id : group) {
+                        if (is_unknown(id)) {
+                            set_known_value(id, false);
+                            state_changed = true;
+                        }
+                    }
+                }
+
+                // 4. Backward Deduction: If all but ONE are false, the last MUST be true
+                if (true_count == 0 && unknown_count == 1) {
+                    set_known_value(last_unknown_id, true);
+                    state_changed = true;
+                }
+            }
+        }
+        
+        return true; // Deduction complete, state is logically sound
+    }
 };
 
 /**
