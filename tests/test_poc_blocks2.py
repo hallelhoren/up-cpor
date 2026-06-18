@@ -31,8 +31,8 @@ def run_poc():
             print("POC Success! Plan found:")
             print("====================================")
             if result.plan:
-                for idx, action in enumerate(result.plan.actions):
-                    print(f"{idx + 1}. {action}")
+                # הספרייה יודעת להדפיס עץ מותנה בעצמה!
+                print(result.plan)
         else:
             print("\\nPOC Failed to find a solution.")
 

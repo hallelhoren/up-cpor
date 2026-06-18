@@ -105,6 +105,12 @@ extern "C" {
         
         PartiallySpecifiedState initial_state(global_problem.total_predicates, global_problem.total_functions);
         
+        // --- ADD THESE 3 LINES: Closed World Assumption ---
+        int blocks = (global_problem.total_predicates / 64) + 1;
+        initial_state.known_mask.assign(blocks, ~0ULL); // הכל מסומן כידוע
+        initial_state.value_mask.assign(blocks, 0);     // הכל שקר כברירת מחדל
+        // --------------------------------------------------
+
         // 1. EXPLICITLY TRUE FACTS
         for (int fact_id : global_problem.initial_true_facts) {
             initial_state.set_known_value(fact_id, true);
@@ -124,12 +130,12 @@ extern "C" {
         
         //  Observable facts are UNKNOWN.
         // If an action senses a fact, that fact is inherently a hidden variable.
-        for (const auto& action : global_problem.actions) {
-            if (action.observe_predicate_id != -1) {
-                int obs = action.observe_predicate_id;
-                initial_state.known_mask[obs / 64] &= ~(1ULL << (obs % 64)); // Force to Unknown
-            }
-        }
+        //for (const auto& action : global_problem.actions) {
+        //    if (action.observe_predicate_id != -1) {
+        //        int obs = action.observe_predicate_id;
+        //        initial_state.known_mask[obs / 64] &= ~(1ULL << (obs % 64)); // Force to Unknown
+        //    }
+        //}
 
         int root_idx = global_solver->create_root_node(initial_state);
         

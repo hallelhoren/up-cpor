@@ -329,18 +329,15 @@ class CPORImpl(Engine, OneshotPlannerMixin):
         problem_name = getattr(problem, 'name', '').lower()
         if "blocks" in problem_name or "bw-rand" in problem_name:
             from up_cpor.problem_grounder import run_my_grounder_and_solve 
-            from unified_planning.plans import SequentialPlan
+            from unified_planning.plans import ContingentPlan
             
-            # קריאה לפונקציה החדשה שמשתמשת בגראונדר שלך
-            plan_actions = run_my_grounder_and_solve(problem)
+            root_node = run_my_grounder_and_solve(problem)
             
-            if not plan_actions:
+            if not root_node:
                 return PlanGenerationResult(PlanGenerationResultStatus.UNSOLVABLE_PROVEN, None, self.name)
             
-            return PlanGenerationResult(PlanGenerationResultStatus.SOLVED_SATISFICING, SequentialPlan(plan_actions), self.name)
+            return PlanGenerationResult(PlanGenerationResultStatus.SOLVED_SATISFICING, ContingentPlan(root_node), self.name)
         # =====================================================================
-        # =====================================================================
-
         if not self.supports(problem.kind):
             return PlanGenerationResult(PlanGenerationResultStatus.UNSOLVABLE_PROVEN, None, self.name)
 

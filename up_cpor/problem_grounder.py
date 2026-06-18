@@ -59,6 +59,20 @@ try:
     #cpor_lib.solve_problem_poc.restype = ctypes.c_int
     cpor_lib.solve_poc_bfs.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     cpor_lib.solve_poc_bfs.restype = ctypes.c_int
+    cpor_lib.solve_native.argtypes = []
+    cpor_lib.solve_native.restype = ctypes.c_bool
+    
+    cpor_lib.get_chosen_action.argtypes = [ctypes.c_int]
+    cpor_lib.get_chosen_action.restype = ctypes.c_int
+
+    cpor_lib.get_single_child.argtypes = [ctypes.c_int]
+    cpor_lib.get_single_child.restype = ctypes.c_int
+
+    cpor_lib.get_true_child.argtypes = [ctypes.c_int]
+    cpor_lib.get_true_child.restype = ctypes.c_int
+
+    cpor_lib.get_false_child.argtypes = [ctypes.c_int]
+    cpor_lib.get_false_child.restype = ctypes.c_int
     
 except OSError:
     print(f"WARNING: Native library not found at {_lib_path}. Please compile using CMake.")
@@ -188,8 +202,10 @@ class UpCporConverter:
         # ===================================================================
         action_idx = 0
         for action, subs in reachable_actions:
-            self.action_id_to_up_action[action_idx] = action
-
+            # בניית ActionInstance תקני שכולל את הפעולה ואת האובייקטים שעליהם היא מופעלת
+            actual_params = tuple(subs[p] for p in action.parameters)
+            actual_params = tuple(subs[p] for p in action.parameters)
+            self.action_id_to_up_action[action_idx] = ActionInstance(action, actual_params)
             pre_rpn = []
             for i, p in enumerate(action.preconditions):
                 grounded_p = substituter.substitute(p, subs)
@@ -394,34 +410,60 @@ def createActionTree(self, cpp_solution_node, problem) -> ContingentPlanNode:
 # כאן מתחיל קוד ה-POC שלך שמשתמש בגראונדר האמיתי שבנית:
 # ====================================================================
 def run_my_grounder_and_solve(problem):
-    import ctypes
     from up_cpor.problem_grounder import UpCporConverter, cpor_lib
-    
+    from unified_planning.plans.contingent_plan import ContingentPlanNode
+    from unified_planning.model.walkers import Substituter
+
     print(f"[My Grounder] Grounding and pushing {problem.name} to C++...")
-    
-    # 1. הפעלת ה-Grounder שלך - דוחף הכל לזיכרון ב-C++
     converter = UpCporConverter()
     converter.generate_native_problem(problem)
-    
-    # 2. הפעלת האלגוריתם שלך ב-C++ (שמשתמש ב-Evaluator שלך)
-    print("[Native API] Running C++ POC BFS Solver...")
-    max_len = 1000
-    out_array = (ctypes.c_int * max_len)()
-    
-    plan_length = cpor_lib.solve_poc_bfs(out_array, max_len)
-    
-    if plan_length < 0:
-        print("[Native API] C++ returned NO SOLUTION.")
-        return []
-        
-    print(f"[Native API] C++ found a plan of length {plan_length}.")
-    
-    # 3. תרגום ה-IDs בחזרה לפעולות פייתון באמצעות המילון שהגראונדר שלך בנה
-    solved_ids = [out_array[i] for i in range(plan_length)]
-    plan_actions = [converter.action_id_to_up_action[a_id] for a_id in solved_ids]
-    
-    return plan_actions
 
+    print("[Native API] Invoking YOUR solve_native()...")
+    success = cpor_lib.solve_native()
+
+    if not success:
+        print("[Native API] CPORSolver returned NO SOLUTION.")
+        return None
+
+    print("[Native API] Contingent Plan Found! Extracting tree...")
+    substituter = Substituter(problem.environment)
+
+    # חילוץ רקורסיבי של העץ מה-C++
+    def extract_node(node_idx):
+        if node_idx == -1: return None
+        
+        action_id = cpor_lib.get_chosen_action(node_idx)
+        if action_id == -1: return None
+            
+        action_instance = converter.action_id_to_up_action[action_id]
+        node = ContingentPlanNode(action_instance)
+        
+        true_idx = cpor_lib.get_true_child(node_idx)
+        false_idx = cpor_lib.get_false_child(node_idx)
+        single_idx = cpor_lib.get_single_child(node_idx)
+        
+        if true_idx != -1 or false_idx != -1:
+            obs_fluent = None
+            if hasattr(action_instance.action, 'observed_fluents') and action_instance.action.observed_fluents:
+                subs = dict(zip(action_instance.action.parameters, action_instance.actual_parameters))
+                obs_fluent = substituter.substitute(action_instance.action.observed_fluents[0], subs)
+            
+            if true_idx != -1:
+                child_t = extract_node(true_idx)
+                if child_t:
+                    node.add_child({obs_fluent: problem.environment.expression_manager.TRUE()}, child_t)
+            if false_idx != -1:
+                child_f = extract_node(false_idx)
+                if child_f:
+                    node.add_child({obs_fluent: problem.environment.expression_manager.FALSE()}, child_f)
+        else:
+            child = extract_node(single_idx)
+            if child:
+                node.add_child({}, child)
+        
+        return node
+        
+    return extract_node(0) # שורש העץ ב-C++ הוא תמיד 0
 
 def extract_grounded_problem_data(problem):
     from unified_planning.engines.compilers import Grounder
