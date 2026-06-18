@@ -24,7 +24,9 @@ OP_FALSE = -7
 # ---------------------------------------------------------------------------
 # ctypes C++ Library Loader
 # ---------------------------------------------------------------------------
-_lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tests', 'libcpor_core.so'))
+_lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'libcpor_core.so'))
+
+
 try:
     cpor_lib = ctypes.CDLL(_lib_path)
     
@@ -47,9 +49,20 @@ try:
     ]
     cpor_lib.add_oneof_constraint.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     cpor_lib.add_deadend_rpn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    cpor_lib.add_grounded_action_to_cpp.argtypes = [
+        ctypes.c_int,                                # action_id
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,  # pre_rpn, pre_len
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_bool), ctypes.c_int, # eff_facts, eff_vals, eff_len
+        ctypes.c_int                                 # observe_id
+    ]
+    #cpor_lib.solve_problem_poc.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    #cpor_lib.solve_problem_poc.restype = ctypes.c_int
+    cpor_lib.solve_poc_bfs.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    cpor_lib.solve_poc_bfs.restype = ctypes.c_int
     
 except OSError:
     print(f"WARNING: Native library not found at {_lib_path}. Please compile using CMake.")
+    cpor_lib = None
 
 
 class UpCporConverter:
@@ -373,3 +386,181 @@ class UpCporConverter:
 
     def createActionTree(self, cpp_solution_node, problem) -> ContingentPlanNode:
         pass
+
+def createActionTree(self, cpp_solution_node, problem) -> ContingentPlanNode:
+        pass
+
+# ====================================================================
+# כאן מתחיל קוד ה-POC שלך שמשתמש בגראונדר האמיתי שבנית:
+# ====================================================================
+def run_my_grounder_and_solve(problem):
+    import ctypes
+    from up_cpor.problem_grounder import UpCporConverter, cpor_lib
+    
+    print(f"[My Grounder] Grounding and pushing {problem.name} to C++...")
+    
+    # 1. הפעלת ה-Grounder שלך - דוחף הכל לזיכרון ב-C++
+    converter = UpCporConverter()
+    converter.generate_native_problem(problem)
+    
+    # 2. הפעלת האלגוריתם שלך ב-C++ (שמשתמש ב-Evaluator שלך)
+    print("[Native API] Running C++ POC BFS Solver...")
+    max_len = 1000
+    out_array = (ctypes.c_int * max_len)()
+    
+    plan_length = cpor_lib.solve_poc_bfs(out_array, max_len)
+    
+    if plan_length < 0:
+        print("[Native API] C++ returned NO SOLUTION.")
+        return []
+        
+    print(f"[Native API] C++ found a plan of length {plan_length}.")
+    
+    # 3. תרגום ה-IDs בחזרה לפעולות פייתון באמצעות המילון שהגראונדר שלך בנה
+    solved_ids = [out_array[i] for i in range(plan_length)]
+    plan_actions = [converter.action_id_to_up_action[a_id] for a_id in solved_ids]
+    
+    return plan_actions
+
+
+def extract_grounded_problem_data(problem):
+    from unified_planning.engines.compilers import Grounder
+    from unified_planning.plans import ActionInstance
+    
+    # שימוש ב-Grounder הסטנדרטי של UP
+    with Grounder(problem=problem) as grounder:
+        grounded_result = grounder.compile()
+        g_problem = grounded_result.problem
+    
+    fluent_to_id = {}
+    current_id = 0
+    
+    # מיפוי פלואנטים למספרים
+    for f_node in g_problem.initial_values.keys():
+        if f_node not in fluent_to_id:
+            fluent_to_id[f_node] = current_id
+            current_id += 1
+            
+    initial_true = []
+    initial_false = []
+    for f_node, val in g_problem.initial_values.items():
+        if val.is_true():
+            initial_true.append(fluent_to_id[f_node])
+        else:
+            initial_false.append(fluent_to_id[f_node])
+            
+    action_map = {}
+    actions_data = []
+    
+    # TODO: כאן עליך ליצור מופע של המחלקה שלך שמכילה את ה-_compile_to_rpn 
+    # compiler = MyRPNCompiler()
+    
+    for i, action in enumerate(g_problem.actions):
+        action_map[i] = ActionInstance(action)
+        
+        # TODO: החלף את הרשימה הריקה בקריאה לפונקציית ה-RPN הכללית שלך
+        # pre_rpn = compiler._compile_to_rpn(action.preconditions)
+        pre_rpn = [] 
+        
+        eff_facts = []
+        eff_vals = []
+        for eff in action.effects:
+            if eff.fluent in fluent_to_id:
+                eff_facts.append(fluent_to_id[eff.fluent])
+                eff_vals.append(eff.value.is_true())
+                
+        actions_data.append({
+            'id': i,
+            'pre_rpn': pre_rpn,
+            'eff_facts': eff_facts,
+            'eff_vals': eff_vals
+        })
+        
+    # TODO: החלף את הרשימה הריקה בקריאה לפונקציית ה-RPN שלך עבור מטרות
+    # goal_rpn = compiler._compile_to_rpn(g_problem.goals)
+    goal_rpn = [] 
+    
+    data = {
+        'total_predicates': current_id,
+        'initial_true': initial_true,
+        'initial_false': initial_false,
+        'actions': actions_data,
+        'goal_rpn': goal_rpn
+    }
+    
+    return data, action_map
+
+
+# ... (כל הקוד הקיים שלך בקובץ) ...
+
+def extract_grounded_problem_data(problem):
+    """
+    Extracts purely python-native grounded data (IDs and RPN lists) from a unified_planning problem.
+    This does NOT interact with ctypes.
+    """
+    from unified_planning.shortcuts import Compiler
+    from unified_planning.engines import CompilationKind
+    from unified_planning.plans import ActionInstance
+    
+    print("[Grounder] Compiling grounded problem...")
+    with Compiler(problem_kind=problem.kind, compilation_kind=CompilationKind.GROUNDING) as grounder:
+        grounded_result = grounder.compile(problem, CompilationKind.GROUNDING)
+        g_problem = grounded_result.problem
+    
+    fluent_to_id = {}
+    current_id = 0
+    
+    # מיפוי כל הפלואנטים במצב ההתחלתי למספרים שלמים
+    for f_node in g_problem.initial_values.keys():
+        if f_node not in fluent_to_id:
+            fluent_to_id[f_node] = current_id
+            current_id += 1
+            
+    initial_true = []
+    initial_false = []
+    for f_node, val in g_problem.initial_values.items():
+        if val.is_true():
+            initial_true.append(fluent_to_id[f_node])
+        else:
+            initial_false.append(fluent_to_id[f_node])
+            
+    action_map = {}
+    actions_data = []
+    
+    # אנו יוצרים מופע של המחלקה שכבר קיימת אצלך, בהנחה שקוראים לה UpCporConverter
+    # או כל מחלקה אחרת שמכילה את _compile_to_rpn.
+    # אם המתודה שלך מוגדרת אחרת (למשל היא גלובלית), פשוט קרא לה.
+    compiler = UpCporConverter() 
+    
+    print(f"[Grounder] Extracting {len(g_problem.actions)} actions...")
+    for i, action in enumerate(g_problem.actions):
+        action_map[i] = ActionInstance(action)
+        
+        # שימוש בפונקציית ה-RPN המקורית שלך
+        pre_rpn = compiler._compile_to_rpn(action.preconditions)
+        
+        eff_facts = []
+        eff_vals = []
+        for eff in action.effects:
+            if eff.fluent in fluent_to_id:
+                eff_facts.append(fluent_to_id[eff.fluent])
+                eff_vals.append(eff.value.is_true())
+                
+        actions_data.append({
+            'id': i,
+            'pre_rpn': pre_rpn,
+            'eff_facts': eff_facts,
+            'eff_vals': eff_vals
+        })
+        
+    goal_rpn = compiler._compile_to_rpn(g_problem.goals)
+    
+    data = {
+        'total_predicates': current_id,
+        'initial_true': initial_true,
+        'initial_false': initial_false,
+        'actions': actions_data,
+        'goal_rpn': goal_rpn
+    }
+    
+    return data, action_map

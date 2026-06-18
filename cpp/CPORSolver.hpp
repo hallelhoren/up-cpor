@@ -48,7 +48,7 @@ private:
         std::vector<int> fact_achiever(global_problem.total_predicates, -1);
         std::vector<int> action_layer(global_problem.actions.size(), -1);
         
-        if (Evaluator::evaluate_rpn(global_problem.goal_rpn, relaxed_state) == VAL_TRUE) return 0;
+        if (Evaluator::evaluate_rpn_raw(global_problem.goal_rpn, relaxed_state) == VAL_TRUE) return 0;
 
         int current_layer = 0;
         while (true) {
@@ -66,24 +66,23 @@ private:
                 // L1 CACHE OPTIMIZATION: Bitwise Precondition Evaluation
                 // ----------------------------------------------------------------
                 bool is_applicable = false;
-                
-                if (!action.has_complex_precondition) {
-                    is_applicable = true;
+                // if (!action.has_complex_precondition) {
+                //   is_applicable = true;
                     // ULTRA-FAST BITWISE SUBSET CHECK: (State & Precondition) == Precondition
-                    for (size_t k = 0; k < action.fast_precondition_mask.size(); ++k) {
-                        // A fact is explicitly True if both known and value bits are 1
-                        uint64_t actual_true_bits = relaxed_state.known_mask[k] & relaxed_state.value_mask[k];
+                //    for (size_t k = 0; k < action.fast_precondition_mask.size(); ++k) {
+                //        // A fact is explicitly True if both known and value bits are 1
+                //        uint64_t actual_true_bits = relaxed_state.known_mask[k] & relaxed_state.value_mask[k];
                         
                         // Check if the state contains all bits required by the action's precondition
-                        if ((actual_true_bits & action.fast_precondition_mask[k]) != action.fast_precondition_mask[k]) {
-                            is_applicable = false;
-                            break;
-                        }
-                    }
-                } else {
+                //        if ((actual_true_bits & action.fast_precondition_mask[k]) != action.fast_precondition_mask[k]) {
+                //            is_applicable = false;
+                //            break;
+                //        }
+                //    }
+                //} else {
                     // Fallback to heavy stack evaluator only for complex conditional logic
-                    is_applicable = (Evaluator::evaluate_rpn(action.precondition_rpn, relaxed_state) == VAL_TRUE);
-                }
+                is_applicable = (Evaluator::evaluate_rpn_raw(action.precondition_rpn, relaxed_state) == VAL_TRUE);
+                //}
 
                 if (is_applicable) {
                     bool applied_effect = false;
@@ -100,7 +99,7 @@ private:
 
                     // 2. Conditional effects
                     for (const auto& cond_eff : action.conditional_effects) {
-                        if (Evaluator::evaluate_rpn(cond_eff.condition_rpn, relaxed_state) == VAL_TRUE) {
+                        if (Evaluator::evaluate_rpn_raw(cond_eff.condition_rpn, relaxed_state) == VAL_TRUE) {
                             for (const auto& eff : cond_eff.effects) {
                                 if (eff.second == true && !next_layer.is_true(eff.first)) {
                                     next_layer.set_known_value(eff.first, true);
@@ -128,7 +127,7 @@ private:
             if (min_cost_this_layer != 999999) total_cost += min_cost_this_layer;
             else total_cost += 1;
 
-            if (Evaluator::evaluate_rpn(global_problem.goal_rpn, next_layer) == VAL_TRUE) {
+            if (Evaluator::evaluate_rpn_raw(global_problem.goal_rpn, next_layer) == VAL_TRUE) {
                 
                 // Goal reached. Initiate Fast Forward backtrace
                 std::vector<int> goals_to_achieve;
@@ -227,7 +226,7 @@ private:
 
         // 2. Evaluate and Apply Conditional Effects (Knowledge Loss)
         for (const auto& cond_eff : action.conditional_effects) {
-            uint8_t eval = Evaluator::evaluate_rpn(cond_eff.condition_rpn, current);
+            uint8_t eval = Evaluator::evaluate_rpn_raw(cond_eff.condition_rpn, current);
             
             if (eval == VAL_TRUE) {
                 for (const auto& eff : cond_eff.effects) {
@@ -259,7 +258,7 @@ private:
             const PlanNode& curr_node = node_pool[curr_idx];
             
             // 1. Evaluate the formula in the current historical state
-            uint8_t eval = Evaluator::evaluate_rpn(current_rpn, curr_node.state);
+            uint8_t eval = Evaluator::evaluate_rpn_raw(current_rpn, curr_node.state);
             
             // If we find explicit truth or falsehood, the regression concludes
             if (eval == VAL_TRUE) return true;
@@ -331,7 +330,7 @@ private:
     bool is_action_applicable(const GroundedAction& action, PartiallySpecifiedState& current_state, int current_node_idx) {
         if (action.precondition_rpn.empty()) return true;
 
-        uint8_t eval_result = Evaluator::evaluate_rpn(action.precondition_rpn, current_state);
+        uint8_t eval_result = Evaluator::evaluate_rpn_raw(action.precondition_rpn, current_state);
 
         if (eval_result == VAL_TRUE) return true;
         if (eval_result == VAL_FALSE) return false;
@@ -371,13 +370,13 @@ private:
             changed = false;
             
             // Check if goal is satisfied in the relaxed graph
-            if (Evaluator::evaluate_rpn(global_problem.goal_rpn, relaxed_state) == VAL_TRUE) {
+            if (Evaluator::evaluate_rpn_raw(global_problem.goal_rpn, relaxed_state) == VAL_TRUE) {
                 return false;
             }
 
             // Apply all applicable actions accumulating positive facts
             for (const auto& action : global_problem.actions) {
-                if (Evaluator::evaluate_rpn(action.precondition_rpn, relaxed_state) == VAL_TRUE) {
+                if (Evaluator::evaluate_rpn_raw(action.precondition_rpn, relaxed_state) == VAL_TRUE) {
                     
                     // Accumulate guaranteed effects
                     for (const auto& eff : action.guaranteed_effects) {
@@ -393,7 +392,7 @@ private:
 
                     // Accumulate conditional effects
                     for (const auto& cond_eff : action.conditional_effects) {
-                        if (Evaluator::evaluate_rpn(cond_eff.condition_rpn, relaxed_state) == VAL_TRUE) {
+                        if (Evaluator::evaluate_rpn_raw(cond_eff.condition_rpn, relaxed_state) == VAL_TRUE) {
                             for (const auto& eff : cond_eff.effects) {
                                 int fact_id = eff.first;
                                 bool is_positive = eff.second;
@@ -514,7 +513,7 @@ public:
         if (failed_cache.find(current_state) != failed_cache.end()) return false;
 
         // Evaluate goal
-        if (Evaluator::evaluate_rpn(global_problem.goal_rpn, current_state) == VAL_TRUE) {
+        if (Evaluator::evaluate_rpn_raw(global_problem.goal_rpn, current_state) == VAL_TRUE) {
             node_pool[node_idx].is_solved = true;
             solved_cache[current_state] = node_idx;
             return true;

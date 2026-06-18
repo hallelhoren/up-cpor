@@ -13,13 +13,32 @@ else:
         System.Environment.SetEnvironmentVariable("DOTNET_ROOT", "/usr/local/share/dotnet")
 
 PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
-DLL_PATH = os.path.join(PROJECT_PATH, "CPORLib.dll")
-clr.AddReference(DLL_PATH)
 
-from CPORLib.PlanningModel import Domain, Problem, ParametrizedAction, PlanningAction, Simulator
-from CPORLib.LogicalUtilities import Predicate, ParametrizedPredicate, GroundedPredicate, PredicateFormula, CompoundFormula, Formula
-from CPORLib.Algorithms import CPORPlanner, SDRPlanner
-from CPORLib.Tools import RandomGenerator, Utilities
+# חיפוש חכם ל-DLL של ה-C# בספריות הבנייה
+possible_dll_paths = [
+    os.path.join(PROJECT_PATH, "CPORLib.dll"),
+    os.path.abspath(os.path.join(PROJECT_PATH, "..", "CPORLib", "bin", "Release", "netstandard2.0", "CPORLib.dll")),
+    os.path.abspath(os.path.join(PROJECT_PATH, "..", "CPORLib", "bin", "Debug", "netstandard2.0", "CPORLib.dll"))
+]
+
+dll_loaded = False
+for p in possible_dll_paths:
+    if os.path.exists(p):
+        clr.AddReference(p)
+        dll_loaded = True
+        break
+
+if not dll_loaded:
+    print(f"WARNING: CPORLib.dll not found in any of the expected locations.")
+
+try:
+    from CPORLib.PlanningModel import Domain, Problem, ParametrizedAction, PlanningAction, Simulator
+    from CPORLib.LogicalUtilities import Predicate, ParametrizedPredicate, GroundedPredicate, PredicateFormula, CompoundFormula, Formula
+    from CPORLib.Algorithms import CPORPlanner, SDRPlanner
+    from CPORLib.Tools import RandomGenerator, Utilities
+except ImportError:
+    print("WARNING: C# CPORLib failed to load (Mono/WSL issue). Legacy C# engine is disabled.")
+    print("-> C++ POC components and pure Python modules will continue to work.")
 
 from unified_planning.model import FNode, OperatorKind, Fluent, Effect
 from unified_planning.model.contingent import SensingAction

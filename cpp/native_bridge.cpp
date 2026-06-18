@@ -2,6 +2,7 @@
 #include "State.hpp"
 #include "Evaluator.hpp"
 #include "CPORSolver.hpp" 
+#include "BFSSolver.hpp"
 #include <vector>
 #include <iostream>
 #include <unordered_set>
@@ -133,8 +134,7 @@ extern "C" {
         int root_idx = global_solver->create_root_node(initial_state);
         
         // Pass an initially empty set to track the current search path for cycle detection
-        std::unordered_set<PartiallySpecifiedState, StateHasher> current_path_indices;
-        // Preallocate reasonable depth to prevent vector resizing mid-search
+        std::vector<int> current_path_indices;        // Preallocate reasonable depth to prevent vector resizing mid-search
         current_path_indices.reserve(1024); 
 
         bool success = global_solver->solve_from_node(root_idx, current_path_indices);
@@ -205,5 +205,43 @@ extern "C" {
     int get_action_observe_id(int action_id) {
         if (action_id >= global_problem.actions.size()) return -1;
         return global_problem.actions[action_id].observe_predicate_id;
+    }
+    // ==================================================================
+    // NEW POC API: Adds a full action with RPN preconditions and effects
+    // ==================================================================
+    void add_grounded_action_to_cpp(int action_id, int* pre_rpn, int pre_len, 
+                                    int* eff_facts, bool* eff_vals, int eff_len, 
+                                    int observe_id) {
+        GroundedAction action;
+        action.id = action_id;
+        action.observe_predicate_id = observe_id;
+        
+        for (int i = 0; i < pre_len; ++i) {
+            action.precondition_rpn.push_back(pre_rpn[i]);
+        }
+        
+        for (int i = 0; i < eff_len; ++i) {
+            action.guaranteed_effects.push_back({eff_facts[i], eff_vals[i]});
+        }
+        
+        global_problem.actions.push_back(action);
+    }
+
+    // ==================================================================
+    // NEW POC API: Executes simple BFS and returns path of action IDs
+    // ==================================================================
+    int solve_poc_bfs(int* out_action_ids, int max_length) {
+        BFSSolver solver;
+        std::vector<int> plan = solver.solve();
+        
+        if (plan.empty()) {
+            return -1;
+        }
+        
+        int len = std::min((int)plan.size(), max_length);
+        for (int i = 0; i < len; ++i) {
+            out_action_ids[i] = plan[i];
+        }
+        return len;
     }
 } // End of extern "C"

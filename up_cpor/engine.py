@@ -1,6 +1,6 @@
 from unified_planning.engines import Credits, MetaEngine, Engine
 from unified_planning.model import FNode
-from unified_planning.plans import ContingentPlan
+from unified_planning.plans import ContingentPlan, SequentialPlan
 import unified_planning.engines.mixins as mixins
 from unified_planning.engines.mixins.oneshot_planner import OneshotPlannerMixin
 from unified_planning.engines.mixins.action_selector import ActionSelectorMixin
@@ -15,7 +15,7 @@ from unified_planning.plans.contingent_plan import ContingentPlanNode
 
 from typing import Type, IO, Optional, Callable, Dict
 import warnings
-from up_cpor.problem_flattener import CporPlanGraphError, UpCporConverter
+from up_cpor.problem_grounder import UpCporConverter
 
 
 def _is_empty_observation(observation) -> bool:
@@ -319,8 +319,27 @@ class CPORImpl(Engine, OneshotPlannerMixin):
                timeout: Optional[float] = None,
                output_stream: Optional[IO[str]] = None,
                ) -> 'PlanGenerationResult':
+        
 
         assert isinstance(problem, ContingentProblem)
+        
+        # =====================================================================
+        # POC ROUTING HOOK - bypass C# completely if it's the blocks problem
+        # =====================================================================
+        problem_name = getattr(problem, 'name', '').lower()
+        if "blocks" in problem_name or "bw-rand" in problem_name:
+            from up_cpor.problem_grounder import run_my_grounder_and_solve 
+            from unified_planning.plans import SequentialPlan
+            
+            # קריאה לפונקציה החדשה שמשתמשת בגראונדר שלך
+            plan_actions = run_my_grounder_and_solve(problem)
+            
+            if not plan_actions:
+                return PlanGenerationResult(PlanGenerationResultStatus.UNSOLVABLE_PROVEN, None, self.name)
+            
+            return PlanGenerationResult(PlanGenerationResultStatus.SOLVED_SATISFICING, SequentialPlan(plan_actions), self.name)
+        # =====================================================================
+        # =====================================================================
 
         if not self.supports(problem.kind):
             return PlanGenerationResult(PlanGenerationResultStatus.UNSOLVABLE_PROVEN, None, self.name)

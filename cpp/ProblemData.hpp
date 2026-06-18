@@ -1,5 +1,5 @@
 #pragma once
-
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <utility>
@@ -55,7 +55,7 @@ struct GroundedAction {
      */
     std::vector<int> precondition_rpn{};
 
-    std::vector<uint64_t> fast_precondition_mask{};
+    // std::vector<uint64_t> fast_precondition_mask{};
 
     /** * @brief The effects of the action, represented as a list of (predicate_id, new_truth_value).
      * * Using flat integer pairs eliminates the need for allocating `Predicate` objects on the heap.

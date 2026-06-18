@@ -1,0 +1,87 @@
+#pragma once
+#include <vector>
+#include <queue>
+#include <unordered_set>
+#include <iostream>
+#include "State.hpp"
+#include "Evaluator.hpp"
+#include "ActionApplier.hpp"
+#include "ProblemData.hpp"
+
+extern ProblemDef global_problem;
+
+class BFSSolver {
+public:
+    std::vector<int> solve() {
+        PartiallySpecifiedState initial_state;
+        
+        int blocks = (global_problem.total_predicates / 64) + 1;
+        
+        // ==========================================================
+        // FIX: Closed World Assumption (CWA)
+        // 1. Set all bits in known_mask to 1 (~0ULL) -> Everything is KNOWN
+        // 2. Set all bits in value_mask to 0 -> Everything is FALSE by default
+        // ==========================================================
+        initial_state.known_mask.assign(blocks, ~0ULL);
+        initial_state.value_mask.assign(blocks, 0);
+
+        // Apply explicitly TRUE facts from the Grounder
+        for (int id : global_problem.initial_true_facts) {
+            initial_state.value_mask[id / 64] |= (1ULL << (id % 64));
+        }
+        
+        // (Optional) Apply explicitly FALSE facts, though already 0
+        for (int id : global_problem.initial_false_facts) {
+            initial_state.value_mask[id / 64] &= ~(1ULL << (id % 64));
+        }
+
+        std::queue<std::pair<PartiallySpecifiedState, std::vector<int>>> q;
+        std::unordered_set<PartiallySpecifiedState, StateHasher> visited;
+
+        q.push({initial_state, {}});
+        visited.insert(initial_state);
+        
+        int expanded = 0;
+
+        while (!q.empty()) {
+            auto current = q.front();
+            q.pop();
+
+            PartiallySpecifiedState curr_state = current.first;
+            std::vector<int> path = current.second;
+
+            // 1. Check Goal using your Evaluator
+            if (Evaluator::evaluate_rpn_raw(global_problem.goal_rpn, curr_state) == VAL_TRUE) {
+                std::cout << "[BFSSolver] Goal found! Expanded " << expanded << " states." << std::endl;
+                return path;
+            }
+
+            // 2. Expand graph
+            for (const auto& action : global_problem.actions) {
+                // Check Preconditions using your Evaluator
+                if (Evaluator::evaluate_rpn_raw(action.precondition_rpn, curr_state) == VAL_TRUE) {
+                    
+                    PartiallySpecifiedState next_state = curr_state;
+                    // Transition State using your Applier
+                    ActionApplier::apply_action(action, next_state);
+
+                    if (visited.find(next_state) == visited.end()) {
+                        visited.insert(next_state);
+                        std::vector<int> next_path = path;
+                        next_path.push_back(action.id);
+                        q.push({next_state, next_path});
+                    }
+                }
+            }
+            
+            expanded++;
+            if (expanded > 100000) {
+                 std::cout << "[BFSSolver] Safety limit reached. Infinite loop?" << std::endl;
+                 break;
+            }
+        }
+        
+        std::cout << "[BFSSolver] Search exhausted. Evaluated " << expanded << " states." << std::endl;
+        return {}; 
+    }
+};
