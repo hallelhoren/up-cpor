@@ -55,8 +55,6 @@ try:
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_bool), ctypes.c_int, # eff_facts, eff_vals, eff_len
         ctypes.c_int                                 # observe_id
     ]
-    #cpor_lib.solve_problem_poc.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
-    #cpor_lib.solve_problem_poc.restype = ctypes.c_int
     cpor_lib.solve_poc_bfs.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
     cpor_lib.solve_poc_bfs.restype = ctypes.c_int
     cpor_lib.solve_native.argtypes = []
@@ -95,7 +93,6 @@ class UpCporConverter:
         self.id_to_function: Dict[int, str] = {}
         self.next_func_id = 0
 
-        self.action_id_to_up_action: Dict[int, ActionInstance] = {}
         self._c_memory_refs: List[ctypes.Array] = []
 
     def generate_native_problem(self, original_problem: up.model.Problem):
@@ -202,10 +199,9 @@ class UpCporConverter:
         # ===================================================================
         action_idx = 0
         for action, subs in reachable_actions:
-            # בניית ActionInstance תקני שכולל את הפעולה ואת האובייקטים שעליהם היא מופעלת
-            actual_params = tuple(subs[p] for p in action.parameters)
             actual_params = tuple(subs[p] for p in action.parameters)
             self.action_id_to_up_action[action_idx] = ActionInstance(action, actual_params)
+            
             pre_rpn = []
             for i, p in enumerate(action.preconditions):
                 grounded_p = substituter.substitute(p, subs)
@@ -281,40 +277,28 @@ class UpCporConverter:
         Checks if a logical formula (FNode) can potentially be satisfied
         given our current set of reachable facts.
         """
-        # 1. Base Constants
         if node.is_true(): return True
         if node.is_false(): return False
 
-        # 2. We hit a Leaf (A Fluent Fact)
-        # e.g., node represents "At(Rover1, WaypointA)"
         if node.is_fluent_exp():
             fluent_str = str(node)
-            # Is this specific string in our bucket of possible facts?
             return fluent_str in reachable_facts
 
-        # 3. It's an AND condition (All children must be reachable)
         if node.is_and():
             for arg in node.args:
                 if not self._is_formula_satisfiable(arg, reachable_facts):
-                    return False  # If even one part is unreachable, the whole AND fails
+                    return False
             return True
 
-        # 4. It's an OR condition (At least one child must be reachable)
         if node.is_or():
             for arg in node.args:
                 if self._is_formula_satisfiable(arg, reachable_facts):
-                    return True   # One success is enough for an OR
+                    return True
             return False
 
-        # 5. It's a NOT condition (Negative preconditions)
-        # Under standard "Delete Relaxation" rules for reachability graphs, 
-        # we optimistically assume negative conditions can always be met.
         if node.is_not():
             return True
             
-        # 6. Fallback (Implies, Iff, etc.)
-        # In Optimistic Reachability, if we hit a weird logical operator, 
-        # we assume it's True so we don't accidentally delete a valid action.
         return True
 
     def _build_fluent_dict(self, problem: up.model.Problem, em):
@@ -403,14 +387,11 @@ class UpCporConverter:
     def createActionTree(self, cpp_solution_node, problem) -> ContingentPlanNode:
         pass
 
-def createActionTree(self, cpp_solution_node, problem) -> ContingentPlanNode:
-        pass
 
 # ====================================================================
-# כאן מתחיל קוד ה-POC שלך שמשתמש בגראונדר האמיתי שבנית:
+# POC Runner
 # ====================================================================
 def run_my_grounder_and_solve(problem):
-    from up_cpor.problem_grounder import UpCporConverter, cpor_lib
     from unified_planning.plans.contingent_plan import ContingentPlanNode
     from unified_planning.model.walkers import Substituter
 
@@ -428,7 +409,6 @@ def run_my_grounder_and_solve(problem):
     print("[Native API] Contingent Plan Found! Extracting tree...")
     substituter = Substituter(problem.environment)
 
-    # חילוץ רקורסיבי של העץ מה-C++
     def extract_node(node_idx):
         if node_idx == -1: return None
         
@@ -463,78 +443,12 @@ def run_my_grounder_and_solve(problem):
         
         return node
         
-    return extract_node(0) # שורש העץ ב-C++ הוא תמיד 0
-
-def extract_grounded_problem_data(problem):
-    from unified_planning.engines.compilers import Grounder
-    from unified_planning.plans import ActionInstance
-    
-    # שימוש ב-Grounder הסטנדרטי של UP
-    with Grounder(problem=problem) as grounder:
-        grounded_result = grounder.compile()
-        g_problem = grounded_result.problem
-    
-    fluent_to_id = {}
-    current_id = 0
-    
-    # מיפוי פלואנטים למספרים
-    for f_node in g_problem.initial_values.keys():
-        if f_node not in fluent_to_id:
-            fluent_to_id[f_node] = current_id
-            current_id += 1
-            
-    initial_true = []
-    initial_false = []
-    for f_node, val in g_problem.initial_values.items():
-        if val.is_true():
-            initial_true.append(fluent_to_id[f_node])
-        else:
-            initial_false.append(fluent_to_id[f_node])
-            
-    action_map = {}
-    actions_data = []
-    
-    # TODO: כאן עליך ליצור מופע של המחלקה שלך שמכילה את ה-_compile_to_rpn 
-    # compiler = MyRPNCompiler()
-    
-    for i, action in enumerate(g_problem.actions):
-        action_map[i] = ActionInstance(action)
-        
-        # TODO: החלף את הרשימה הריקה בקריאה לפונקציית ה-RPN הכללית שלך
-        # pre_rpn = compiler._compile_to_rpn(action.preconditions)
-        pre_rpn = [] 
-        
-        eff_facts = []
-        eff_vals = []
-        for eff in action.effects:
-            if eff.fluent in fluent_to_id:
-                eff_facts.append(fluent_to_id[eff.fluent])
-                eff_vals.append(eff.value.is_true())
-                
-        actions_data.append({
-            'id': i,
-            'pre_rpn': pre_rpn,
-            'eff_facts': eff_facts,
-            'eff_vals': eff_vals
-        })
-        
-    # TODO: החלף את הרשימה הריקה בקריאה לפונקציית ה-RPN שלך עבור מטרות
-    # goal_rpn = compiler._compile_to_rpn(g_problem.goals)
-    goal_rpn = [] 
-    
-    data = {
-        'total_predicates': current_id,
-        'initial_true': initial_true,
-        'initial_false': initial_false,
-        'actions': actions_data,
-        'goal_rpn': goal_rpn
-    }
-    
-    return data, action_map
+    return extract_node(0)
 
 
-# ... (כל הקוד הקיים שלך בקובץ) ...
-
+# ====================================================================
+# Pure Python Extraction Logic
+# ====================================================================
 def extract_grounded_problem_data(problem):
     """
     Extracts purely python-native grounded data (IDs and RPN lists) from a unified_planning problem.
@@ -552,7 +466,7 @@ def extract_grounded_problem_data(problem):
     fluent_to_id = {}
     current_id = 0
     
-    # מיפוי כל הפלואנטים במצב ההתחלתי למספרים שלמים
+    # Map fluents to ID
     for f_node in g_problem.initial_values.keys():
         if f_node not in fluent_to_id:
             fluent_to_id[f_node] = current_id
@@ -569,17 +483,19 @@ def extract_grounded_problem_data(problem):
     action_map = {}
     actions_data = []
     
-    # אנו יוצרים מופע של המחלקה שכבר קיימת אצלך, בהנחה שקוראים לה UpCporConverter
-    # או כל מחלקה אחרת שמכילה את _compile_to_rpn.
-    # אם המתודה שלך מוגדרת אחרת (למשל היא גלובלית), פשוט קרא לה.
     compiler = UpCporConverter() 
+    compiler.fluent_to_id = fluent_to_id  # Inject the mapping so compiler can find IDs
     
     print(f"[Grounder] Extracting {len(g_problem.actions)} actions...")
     for i, action in enumerate(g_problem.actions):
         action_map[i] = ActionInstance(action)
         
-        # שימוש בפונקציית ה-RPN המקורית שלך
-        pre_rpn = compiler._compile_to_rpn(action.preconditions)
+        # CORRECTED: Iterate over preconditions (since it is a list of FNodes)
+        pre_rpn = []
+        for p_idx, p in enumerate(action.preconditions):
+            pre_rpn.extend(compiler._compile_to_rpn(p))
+            if p_idx > 0: 
+                pre_rpn.append(OP_AND)
         
         eff_facts = []
         eff_vals = []
@@ -595,7 +511,12 @@ def extract_grounded_problem_data(problem):
             'eff_vals': eff_vals
         })
         
-    goal_rpn = compiler._compile_to_rpn(g_problem.goals)
+    # CORRECTED: Iterate over goals
+    goal_rpn = []
+    for g_idx, g in enumerate(g_problem.goals):
+        goal_rpn.extend(compiler._compile_to_rpn(g))
+        if g_idx > 0:
+            goal_rpn.append(OP_AND)
     
     data = {
         'total_predicates': current_id,
