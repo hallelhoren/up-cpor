@@ -112,4 +112,6 @@ struct ProblemDef {
 
     // Dead-End constraints. If any of these evaluate to True, the state is pruned.
     std::vector<std::vector<int>> deadend_rpns{};
+
+    std::vector<int> auto_observable_predicates;
 };
