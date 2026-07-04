@@ -1,22 +1,24 @@
 import os
 import ctypes
-import sys
+
+
+
 
 def get_lib_path():
     # Attempt to locate the compiled C++ core library
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     # Adjust this path based on where your build.sh actually puts the .so file
-    possible_paths = [
-        os.path.abspath(os.path.join(base_dir, '..', 'CPORLib', 'bin', 'libcpor_core.so')),
-        os.path.abspath(os.path.join(base_dir, '..', 'libcpor_core.so')),
-        os.path.abspath(os.path.join(base_dir, 'libcpor_core.so'))
-    ]
-    for path in possible_paths:
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"Could not find libcpor_core.so. Looked in: {possible_paths}")
+    LIB_PATH = os.path.join(BASE_DIR, "cpp", "build", "libcpor_core.so")
 
-cpor_lib = ctypes.CDLL(get_lib_path())
+    if not os.path.exists(LIB_PATH):
+        print(f"WARNING: Native library not found at {LIB_PATH}. Please compile using CMake.")
+        raise FileNotFoundError(f"Could not find libcpor_core.so. Looked in: {possible_paths}")
+    else:
+        return ctypes.CDLL(LIB_PATH)
+
+    
+
+cpor_lib = get_lib_path()
 
 # ---------------------------------------------------------
 # Define signatures
