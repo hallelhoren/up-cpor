@@ -6,29 +6,27 @@
 namespace CPOR {
 
 std::vector<int> FFSolver::search(const PartiallySpecifiedState& concrete_state, const ProblemDef& global_problem) {
-    // 1. Memory Safety: Reset FF Global State
-    // The original FF planner relies heavily on static memory arenas. 
-    // We must clear them so the previous replanning turn does not bleed into this one.
     ff_reset_search_state();
     ff_clear_hash_table();
 
-    // 2. Data-Oriented Memory Mapping
-    // Extract the raw C-array pointer from the Dual-Mask bitset. 
-    // Because the SDRSampler has already completely resolved the 'known_mask', 
-    // the 'value_mask' strictly represents a fully observable 2-valued concrete state.
-    const uint64_t* raw_state_ptr = concrete_state.value_mask.data();
+    std::vector<int> true_facts;
+    true_facts.reserve(global_problem.total_predicates);
 
-    // 3. Execute Native C Heuristic Search
-    int plan_length = 0;
-    int* raw_c_plan = ff_search(raw_state_ptr, &plan_length);
-
-    // 4. Handle Unsolvable States / Dead-Ends
-    if (raw_c_plan == nullptr || plan_length < 0) {
-        std::cerr << "[FFSolver] Native FF search hit a dead-end. No valid plan found." << std::endl;
-        return {}; // Return empty vector to trigger the caller's failure logic
+    for (int i = 0; i < global_problem.total_predicates; ++i) {
+        if (concrete_state.is_true(i)) {
+            true_facts.push_back(i);
+        }
     }
 
-    // 5. C to C++ Paradigm Translation
+    int plan_length = 0;
+    
+    // Note: Added static_cast<int> to avoid compiler warnings since size() returns size_t
+    int* raw_c_plan = ff_search(true_facts.data(), static_cast<int>(true_facts.size()), &plan_length);
+
+    if (raw_c_plan == nullptr || plan_length < 0) {
+        return {}; 
+    }
+
     std::vector<int> candidate_plan;
     candidate_plan.reserve(static_cast<size_t>(plan_length));
     
@@ -36,9 +34,6 @@ std::vector<int> FFSolver::search(const PartiallySpecifiedState& concrete_state,
         candidate_plan.push_back(raw_c_plan[i]);
     }
 
-    // 6. Memory Deallocation
-    // Since FF is written in C, it allocated the returned array using malloc().
-    // We must free() it here to prevent continuous memory leaks during execution.
     std::free(raw_c_plan);
 
     return candidate_plan;

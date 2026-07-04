@@ -3,7 +3,9 @@
 #include "BeliefState.hpp"
 #include "ProblemData.hpp"
 
+
 namespace CPOR {
+    using std::vector;
 
 class SDRPlanner {
 private:
@@ -20,7 +22,7 @@ private:
     int pending_sensing_action_id;
 
     // Internal routing for deliberation
-    std::vector<int> compute_linear_plan(const BeliefState& current_belief, const ProblemDef& problem, int sample_size);
+    //std::vector<int> compute_linear_plan(const BeliefState& current_belief, const ProblemDef& problem, int sample_size);
 
 public:
     // Constructor
@@ -32,7 +34,8 @@ public:
     // Phase 2: Environment Ingestion and Epistemic Collapse
     bool apply_observation(bool observation_value);
 
-    int get_next_action();
+    static std::vector<int> compute_linear_plan(const BeliefState& current_belief, const ProblemDef& problem, int sample_size);
+
 };
 
 } // namespace CPOR

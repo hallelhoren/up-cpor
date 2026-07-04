@@ -1,9 +1,23 @@
 #include "SDRPlanner.hpp"
 #include "Evaluator.hpp"
 #include "ActionApplier.hpp"
+#include "SDRSampler.hpp"
+#include "FFSolver.hpp"
+#include "DeadEndManager.hpp"
 #include <iostream>
 
+
 namespace CPOR {
+    
+SDRPlanner::SDRPlanner(const PartiallySpecifiedState& initial_state, const ProblemDef& problem)
+    : belief(initial_state), 
+      global_problem(problem), 
+      next_action_index(0), 
+      expecting_observation(false), 
+      pending_sensing_action_id(-1) 
+{
+    // Initialization complete
+}
 
 int SDRPlanner::get_next_action() {
     // 0. State Machine Lock Check
@@ -173,80 +187,94 @@ bool SDRPlanner::apply_observation(bool observation_value) {
     return true;
 }
 
-bool SDRPlanner::execute_full_simulation() {
-    // Execution safeguard to prevent infinite loops in cyclic or unresolvable domains
-    constexpr int MAX_STEPS = 1000;
-    int step_count = 0;
 
-    std::cout << "--- Starting SDR Full Execution Simulation ---" << std::endl;
+std::vector<int> SDRPlanner::compute_linear_plan(
+    const BeliefState& current_belief, 
+    const ProblemDef& problem, 
+    int sample_size) 
+{
+    // 1. Determinization: Sample diverse concrete "witness" states
+    std::vector<PartiallySpecifiedState> sampled_states = 
+        SDRSampler::sample_concrete_states(current_belief.get_current_state(), problem, sample_size);
 
-    while (true) {
-        // 1. Loop Safeguard Check
-        if (step_count >= MAX_STEPS) {
-            std::cerr << "CRITICAL TIMEOUT: Maximum execution steps (" << MAX_STEPS 
-                      << ") exceeded. The agent is caught in an infinite loop or a degenerate domain." 
-                      << std::endl;
-            return false;
-        }
+    if (sampled_states.empty()) {
+        return {}; // Logically invalid belief state or unrecoverable contradiction
+    }
 
-        // 2. Deliberation and Execution Dispatch
-        // This will either pull the next cached action, trigger a replan, or detect a terminal state.
-        int action_id = get_next_action();
+    // 2. Select the Primary Guide State (s')
+    PartiallySpecifiedState primary_guide_state = sampled_states[0];
 
-        // 3. Return Value Handling
-        if (action_id == -1) {
-            // Goal successfully reached
-            std::cout << "SUCCESS: Goal state confirmed. Execution completed in " 
-                      << step_count << " steps." << std::endl;
-            return true;
-        }
+    // 3. Route to the Classical Forward Search (Native FF C-API Wrapper)
+    std::vector<int> candidate_plan = FFSolver::search(primary_guide_state, problem);
+    
+    if (candidate_plan.empty()) {
+        return {}; // No classical path found
+    }
 
-        if (action_id < -1) {
-            // Fatal planning failure, dead-end, or engine lock
-            std::cerr << "FATAL FAILURE: The simulation aborted at step " << step_count 
-                      << " due to an unrecoverable planning error." << std::endl;
-            return false;
-        }
+    // 4. Witness-State Plan Validation (Multi-State Soundness)
+    std::vector<int> robust_plan;
+    robust_plan.reserve(candidate_plan.size());
 
-        std::cout << "[Step " << step_count << "] Dispatched Action ID: " << action_id << std::endl;
+    for (int action_id : candidate_plan) {
+        const GroundedAction& action = problem.actions[action_id];
+        
+        bool is_unsafe = false;
+        bool causes_divergence = false;
 
-        // 4. Sensing Action Resolution
-        // If the dispatched action was a sensor activation, the state machine is currently locked.
-        if (expecting_observation) {
-            const GroundedAction& sensing_action = global_problem.actions[action_id];
-            
-            // Construct a temporary RPN query for the observed predicate
-            std::vector<int> observation_rpn = { sensing_action.observe_predicate_id };
-
-            // Simulate the environment's physical response. 
-            // Because a separate physical hidden ground-truth state is not passed to this simulation, 
-            // we simulate the outcome by evaluating the predicate optimistically against our current belief.
-            bool simulated_observation_result = Evaluator::evaluate(
-                observation_rpn, 
-                belief.get_current_state(), 
-                EvalMode::OPTIMISTIC
-            );
-
-            std::cout << "  -> Sensing Action Detected. Simulating environmental response: " 
-                      << (simulated_observation_result ? "TRUE" : "FALSE") << std::endl;
-
-            // Ingest the physical observation back into the epistemic state
-            bool observation_successful = apply_observation(simulated_observation_result);
-
-            if (!observation_successful) {
-                // If applying the observation causes a mathematical contradiction with the OneOf invariants
-                std::cerr << "FATAL FAILURE: Epistemic collapse resulted in a logical contradiction at step " 
-                          << step_count << "." << std::endl;
-                return false;
+        // 4A. Validate Preconditions (Pre-Action)
+        for (const PartiallySpecifiedState& witness : sampled_states) {
+            if (Evaluator::evaluate_rpn_raw(action.precondition_rpn, witness) != VAL_TRUE) {
+                is_unsafe = true;
+                break;
             }
         }
 
-        // Advance the execution cycle
-        step_count++;
+        if (is_unsafe) {
+            break; // Truncate BEFORE adding the unsafe action
+        }
+
+        // 4B. Safely apply the action to all realities
+        for (PartiallySpecifiedState& witness : sampled_states) {
+            ActionApplier::apply_action(action, witness);
+        }
+        ActionApplier::apply_action(action, primary_guide_state);
+
+        // 4C. Check for Fatal Dead-Ends (Post-Action)
+        for (const PartiallySpecifiedState& witness : sampled_states) {
+            if (DeadEndManager::check_dead_ends(witness) == DeadEndStatus::FATAL) {
+                is_unsafe = true;
+                break;
+            }
+        }
+
+        if (is_unsafe) {
+            break; // Action was valid to start, but led to a dead-end. Truncate BEFORE adding.
+        }
+
+        // 4D. The action is definitively safe. Add it to our robust plan.
+        robust_plan.push_back(action_id);
+
+        // 4E. Check Observational Parity (Post-Action Sensing Divergence)
+        if (action.observe_predicate_id != -1) {
+            uint8_t primary_observation = Evaluator::evaluate_rpn_raw({action.observe_predicate_id}, primary_guide_state);
+            
+            for (const PartiallySpecifiedState& witness : sampled_states) {
+                uint8_t witness_observation = Evaluator::evaluate_rpn_raw({action.observe_predicate_id}, witness);
+                if (witness_observation != primary_observation) {
+                    causes_divergence = true;
+                    break;
+                }
+            }
+        }
+
+        if (causes_divergence) {
+            // We KEEP the sensing action (already pushed to robust_plan) because it is safe.
+            // But we break here so CPOR can gracefully split the tree based on the divergent truths.
+            break; 
+        }
     }
 
-    // Unreachable due to the infinite loop, but required by C++ standard for non-void functions
-    return false; 
+    return robust_plan;
 }
 
 } // namespace CPOR

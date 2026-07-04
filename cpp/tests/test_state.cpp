@@ -1,6 +1,6 @@
 #include <iostream>
 #include <cassert>
-#include "State.hpp"
+#include "../State.hpp"
 
 ProblemDef global_problem;
 

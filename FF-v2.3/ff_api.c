@@ -4,6 +4,7 @@
  *********************************************************************/
 #include "ff_api.h"
 #include "ff.h"
+#include "search.h"
 #include "memory.h"
 #include "output.h"
 #include "parse.h"

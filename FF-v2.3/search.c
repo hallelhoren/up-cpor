@@ -1230,34 +1230,38 @@ void print_state( State S )
  * and the HashEntry nodes themselves, preventing memory leaks 
  * across continuous replanning turns in the C++ engine.
  */
-void ff_clear_hash_table() {
+void ff_clear_hash_table(void) {
     int i;
-    HashEntry_pointer current_entry, next_entry;
 
-    // Traverse every bucket in the global hash table
-    for (i = 0; i < HASH_SIZE; i++) {
-        current_entry = ghash_table[i];
-
-        // Traverse the linked list of collisions within the current bucket
-        while (current_entry != NULL) {
-            next_entry = current_entry->next;
-
-            // 1. Free the dynamically allocated facts array inside the State struct
-            // FF allocates S.F to hold the integer IDs of true facts.
-            if (current_entry->S.F != NULL) {
-                free(current_entry->S.F);
-                current_entry->S.F = NULL; // Prevent dangling pointer
+    // 1. Clear Enforced Hill Climbing (EHC) Hash Table
+    EhcHashEntry_pointer ehc_current, ehc_next;
+    for (i = 0; i < EHC_HASH_SIZE; i++) {
+        ehc_current = gehc_hash_table[i];
+        while (ehc_current != NULL) {
+            ehc_next = ehc_current->next;
+            if (ehc_current->S.F != NULL) {
+                free(ehc_current->S.F);
+                ehc_current->S.F = NULL;
             }
-
-            // 2. Free the HashEntry bucket node itself
-            free(current_entry);
-
-            // Advance to the next node in the collision chain
-            current_entry = next_entry;
+            free(ehc_current);
+            ehc_current = ehc_next;
         }
+        gehc_hash_table[i] = NULL;
+    }
 
-        // 3. Prevent Double-Free and Dangling Pointers
-        // Reset the bucket pointer to NULL cleanly initializing the table for the next search turn.
-        ghash_table[i] = NULL;
+    // 2. Clear Best-First Search (BFS) Hash Table
+    BfsHashEntry_pointer bfs_current, bfs_next;
+    for (i = 0; i < BFS_HASH_SIZE; i++) {
+        bfs_current = gbfs_hash_table[i];
+        while (bfs_current != NULL) {
+            bfs_next = bfs_current->next;
+            if (bfs_current->S.F != NULL) {
+                free(bfs_current->S.F);
+                bfs_current->S.F = NULL;
+            }
+            free(bfs_current);
+            bfs_current = bfs_next;
+        }
+        gbfs_hash_table[i] = NULL;
     }
 }

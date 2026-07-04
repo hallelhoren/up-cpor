@@ -7,6 +7,8 @@
 #include "State.hpp"
 #include "Evaluator.hpp"
 #include "ProblemData.hpp"
+#include "SDRSampler.hpp"
+#include "FFSolver.hpp"
 
 extern ProblemDef global_problem;
 
@@ -22,6 +24,7 @@ struct PlanNode {
     int generating_action_id{-1};
 
     bool is_solved{false};
+    bool is_failed{false};
     int chosen_action_id{-1};
 
     PlanNode(const PartiallySpecifiedState& s, int act_id) : action_id(act_id), state(s) {}
@@ -31,13 +34,14 @@ class CPORSolver {
 private:
     std::vector<PlanNode> node_pool;
     std::unordered_map<PartiallySpecifiedState, int, StateHasher> solved_cache; 
-    std::unordered_set<PartiallySpecifiedState, StateHasher> failed_cache;      
-
+    std::unordered_set<PartiallySpecifiedState, StateHasher> failed_cache; 
+    
     struct ActionCandidate {
         int action_idx;
         int h_score;
     };
 
+    // Old function, currently in use: compute_heuristic_FF instead of compute_heuristic
     int compute_heuristic(const PartiallySpecifiedState& state, std::vector<int>& out_helpful_actions) {
         PartiallySpecifiedState relaxed_state = state;
         int total_cost = 0;
@@ -264,15 +268,31 @@ private:
         return false;
     }
 
-    bool is_logical_cycle(const PartiallySpecifiedState& current_state, const std::vector<int>& path_indices) {
-        for (int idx : path_indices) {
-            if (node_pool[idx].state == current_state) {
-                return true; 
-            }
+    // Cycle detection for the current branch
+    bool is_logical_cycle(const PartiallySpecifiedState& state, const std::vector<int>& current_path) {
+        for (int idx : current_path) {
+            if (node_pool[idx].state == state) return true;
         }
         return false;
     }
 
+    int compute_heuristic_FF(const PartiallySpecifiedState& state) {
+        // Sample a single concrete witness state (Guide State)
+        auto samples = CPOR::SDRSampler::sample_concrete_states(state, global_problem, 1);
+        if (samples.empty()) {
+            return 999999; // Contradictory state (Dead End)
+        }
+
+        // Run the C-based FF Solver on the determinized guide state
+        std::vector<int> plan = CPOR::FFSolver::search(samples[0], global_problem);
+        if (plan.empty()) {
+            return 999999; // Dead End detected by FF
+        }
+
+        return plan.size(); // Length of the relaxed plan
+    }
+
+    
 public:
     CPORSolver() {
         node_pool.reserve(1000000); 
@@ -353,7 +373,7 @@ public:
 
         if (solved_cache.find(current_state) != solved_cache.end()) {
             int cached_idx = solved_cache[current_state];
-            // שאיבת הפתרון מהזיכרון אל הצומת הנוכחי כדי שפייתון יראה אותו כעץ
+            // Extract the solution from the cache to the current node so Python reconstructs it as a DAG tree
             node_pool[node_idx].chosen_action_id = node_pool[cached_idx].chosen_action_id;
             node_pool[node_idx].single_child_idx = node_pool[cached_idx].single_child_idx;
             node_pool[node_idx].true_child_idx = node_pool[cached_idx].true_child_idx;
@@ -361,7 +381,11 @@ public:
             node_pool[node_idx].is_solved = true;
             return true;
         }
-        if (failed_cache.find(current_state) != failed_cache.end()) return false;
+
+        if (failed_cache.find(current_state) != failed_cache.end()) {
+            node_pool[node_idx].is_failed = true;
+            return false;
+        }
 
         if (Evaluator::evaluate_rpn_raw(global_problem.goal_rpn, current_state) == VAL_TRUE) {
             std::cout << ind << "[CPOR] Node " << node_idx << " -> GOAL REACHED!" << std::endl;
@@ -375,13 +399,14 @@ public:
         std::vector<ActionCandidate> candidates;
         candidates.reserve(global_problem.actions.size());
 
-        std::vector<int> helpful_actions;
-        int base_h = compute_heuristic(current_state, helpful_actions);
+        // Call the C-API determinized FF solver 
+        int base_h = compute_heuristic_FF(current_state);
         
         if (base_h == 999999) {
             std::cout << ind << "[CPOR] Node " << node_idx << " -> DEAD END (Heuristic=999999)" << std::endl;
             current_path_indices.pop_back();
             failed_cache.insert(current_state);
+            node_pool[node_idx].is_failed = true; // explicitly backpropagate failure
             return false; 
         }
 
@@ -394,8 +419,7 @@ public:
                 PartiallySpecifiedState next_state;
                 if (!apply_effects(current_state, action, next_state)) continue;
                 
-                std::vector<int> dummy;
-                h_val = compute_heuristic(next_state, dummy);
+                h_val = compute_heuristic_FF(next_state);
             } else {
                 if (!current_state.is_unknown(action.observe_predicate_id)) continue;
 
@@ -409,9 +433,8 @@ public:
 
                 if (!t_valid && !f_valid) continue;
 
-                std::vector<int> dummy;
-                int h_t = t_valid ? compute_heuristic(t_state, dummy) : 0; 
-                int h_f = f_valid ? compute_heuristic(f_state, dummy) : 0; 
+                int h_t = t_valid ? compute_heuristic_FF(t_state) : 0; 
+                int h_f = f_valid ? compute_heuristic_FF(f_state) : 0; 
                 h_val = std::max(h_t, h_f); 
             }
 
@@ -488,8 +511,10 @@ public:
 
         current_path_indices.pop_back();
         
+        // Final fallback: if all candidates failed (and not just skipped due to a cycle)
         if (!failed_due_to_loop) {
             failed_cache.insert(current_state); 
+            node_pool[node_idx].is_failed = true; // Safely backpropagate the death of this node to its parent
         }
         
         return false; 
