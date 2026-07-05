@@ -1233,35 +1233,37 @@ void print_state( State S )
 void ff_clear_hash_table(void) {
     int i;
 
-    // 1. Clear Enforced Hill Climbing (EHC) Hash Table
+    // 1. Clear EHC Table 
     EhcHashEntry_pointer ehc_current, ehc_next;
     for (i = 0; i < EHC_HASH_SIZE; i++) {
-        ehc_current = gehc_hash_table[i];
+        ehc_current = lehc_hash_entry[i];
         while (ehc_current != NULL) {
             ehc_next = ehc_current->next;
-            if (ehc_current->S.F != NULL) {
-                free(ehc_current->S.F);
-                ehc_current->S.F = NULL;
+            // The State 'S' is inside 'ehc_node'
+            if (ehc_current->ehc_node != NULL && ehc_current->ehc_node->S.F != NULL) {
+                free(ehc_current->ehc_node->S.F);
+                ehc_current->ehc_node->S.F = NULL;
             }
             free(ehc_current);
             ehc_current = ehc_next;
         }
-        gehc_hash_table[i] = NULL;
+        lehc_hash_entry[i] = NULL;
     }
 
-    // 2. Clear Best-First Search (BFS) Hash Table
+    // 2. Clear BFS Table 
     BfsHashEntry_pointer bfs_current, bfs_next;
     for (i = 0; i < BFS_HASH_SIZE; i++) {
-        bfs_current = gbfs_hash_table[i];
+        bfs_current = lbfs_hash_entry[i];
         while (bfs_current != NULL) {
             bfs_next = bfs_current->next;
-            if (bfs_current->S.F != NULL) {
-                free(bfs_current->S.F);
-                bfs_current->S.F = NULL;
+            // The State 'S' is inside 'bfs_node'
+            if (bfs_current->bfs_node != NULL && bfs_current->bfs_node->S.F != NULL) {
+                free(bfs_current->bfs_node->S.F);
+                bfs_current->bfs_node->S.F = NULL;
             }
             free(bfs_current);
             bfs_current = bfs_next;
         }
-        gbfs_hash_table[i] = NULL;
+        lbfs_hash_entry[i] = NULL;
     }
 }

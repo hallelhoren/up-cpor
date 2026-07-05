@@ -88,7 +88,7 @@ int* ff_search(const uint64_t* determinized_state_bitset, int* out_plan_length) 
     make_search_space();
 
     // 3. Perform Planning
-    Bool plan_found = do_enforced_hill_climbing(&ginitial_state, &gplan_states);
+    Bool plan_found = do_enforced_hill_climbing(&ginitial_state, gplan_states);
     if (!plan_found) {
         plan_found = do_best_first_search();
     }

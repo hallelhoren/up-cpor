@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+extern void make_search_space(void);
+
 /*
  * Global Search State Reset
  * Must be called before EVERY search turn to prevent memory leaks and corruption.
