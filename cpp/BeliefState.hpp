@@ -16,6 +16,7 @@ private:
     PartiallySpecifiedState initial_state;
     PartiallySpecifiedState current_state;
     std::vector<int> action_history;
+    std::vector<PartiallySpecifiedState> state_history;
 
 public:
     BeliefState() = default;

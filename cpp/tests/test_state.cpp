@@ -4,11 +4,20 @@
 
 ProblemDef global_problem;
 
+void init_mock_problem(int total_predicates) {
+    global_problem.total_predicates = total_predicates;
+    
+    int blocks = (total_predicates / 64) + 1;
+    // CRITICAL FIX: Ensure the comparable_mask exists so StateHasher doesn't segfault
+    global_problem.comparable_mask.assign(blocks, ~0ULL); 
+}
+
 void run_state_tests() {
     std::cout << "Running State.hpp Tests..." << std::endl;
 
     // 1. Initialize a state with 100 possible predicates
     PartiallySpecifiedState state(100);
+    init_mock_problem(100);
 
     // TEST 1: Everything should start as Unknown
     assert(state.is_unknown(5) == true);

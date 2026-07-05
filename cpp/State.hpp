@@ -4,6 +4,7 @@
 #include <functional>
 #include <cstring>
 #include <limits>
+#include <cmath>
 #include "ProblemData.hpp"
 
 extern ProblemDef global_problem;
@@ -177,31 +178,65 @@ public:
 };
 
 /**
- * @struct StateHasher
+ * @brief Utility function to securely combine hash seeds (avoids XOR cancellation).
+ * Uses the 64-bit golden ratio constant.
  */
-// High performance FNV1a hash implementation
+inline void hash_combine(std::size_t& seed, std::size_t value) {
+    seed ^= value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+}
+
+/**
+ * @brief Standardizes floating point bit-patterns for safe hashing.
+ */
+inline uint64_t canonicalize_double(double val) {
+    // 1. Handle NaN variability (collapse all NaN bit-patterns into one constant)
+    if (std::isnan(val)) {
+        return 0x7FF8000000000000ULL; // Standard Quiet NaN bit pattern
+    }
+    
+    // 2. Collapse negative zero to positive zero
+    if (val == 0.0) { 
+        val = 0.0; 
+    }
+    
+    uint64_t bits;
+    std::memcpy(&bits, &val, sizeof(bits));
+    return bits;
+}
+
+/**
+ * @struct StateHasher
+ * @brief Cryptographically safe, collision-resistant hasher for PartiallySpecifiedState.
+ */
 struct StateHasher {
     std::size_t operator()(const PartiallySpecifiedState& s) const {
-        std::size_t hash = 14695981039346656037ULL; // FNV offset basis
+        std::size_t seed = 0;
 
+        // Hash the Boolean Fluents
         for (size_t i = 0; i < s.known_mask.size(); ++i) {
             uint64_t k_block = s.known_mask[i] & global_problem.comparable_mask[i];
-            uint64_t v_block = s.value_mask[i] & s.known_mask[i] & global_problem.comparable_mask[i];
             
-            hash ^= k_block;
-            hash *= 1099511628211ULL; // FNV prime
-            
-            hash ^= v_block;
-            hash *= 1099511628211ULL;
+            // Mask the value_block with the known_block BEFORE hashing.
+            // This is a foolproof secondary safety net. Even if a garbage bit 
+            // survived in value_mask, it is mathematically erased if known == 0.
+            uint64_t v_block = s.value_mask[i] & k_block;
+
+            hash_combine(seed, std::hash<uint64_t>{}(k_block));
+            hash_combine(seed, std::hash<uint64_t>{}(v_block));
         }
 
-        for (double val : s.function_values) {
-            uint64_t bits;
-            std::memcpy(&bits, &val, sizeof(bits));
-            hash ^= bits;
-            hash *= 1099511628211ULL;
+        // Hash the Numeric Functions
+        for (size_t i = 0; i < s.function_values.size(); ++i) {
+            uint64_t bit = 1ULL << (i % 64);
+            
+            // Only hash the function value IF the agent actually knows it.
+            // Hashing unknown functions causes deterministic identical states to branch.
+            if (s.known_function_mask[i / 64] & bit) {
+                uint64_t canonical_bits = canonicalize_double(s.function_values[i]);
+                hash_combine(seed, std::hash<uint64_t>{}(canonical_bits));
+            }
         }
 
-        return hash;
+        return seed;
     }
 };

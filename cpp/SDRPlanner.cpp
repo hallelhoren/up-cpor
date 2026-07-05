@@ -4,6 +4,7 @@
 #include "SDRSampler.hpp"
 #include "FFSolver.hpp"
 #include "DeadEndManager.hpp"
+#include "BFSSolver.hpp"
 #include <iostream>
 
 
@@ -19,114 +20,140 @@ SDRPlanner::SDRPlanner(const PartiallySpecifiedState& initial_state, const Probl
     // Initialization complete
 }
 
-int SDRPlanner::get_next_action() {
-    // 0. State Machine Lock Check
-    // Strictly prevent the system from dispatching new actions while waiting 
-    // for a physical sensor response from the environment.
-    if (expecting_observation) {
-        std::cerr << "CRITICAL: Cannot get next action. System is locked waiting for an observation." << std::endl;
-        return -2; // Engine locked error code
-    }
-
-    // Cache the current epistemic state as a const reference for fast, read-only evaluations
-    const PartiallySpecifiedState& current_state = belief.get_current_state();
-
-    // 1. Goal Check (Absolute Certainty Required)
-    // The agent must mathematically guarantee all goal conditions are met (PESSIMISTIC mode).
-    if (Evaluator::evaluate(global_problem.goal_rpn, current_state, EvalMode::PESSIMISTIC)) {
-        return -1; // Standard return code for Goal Reached
-    }
-
-    // 2. Dead-End Verification (Safety Guard)
-    // If ANY dead-end condition evaluates to True OR Unknown (OPTIMISTIC mode), 
-    // the agent is mathematically compromised (or risks being compromised) and must halt execution.
-    for (const auto& deadend_rpn : global_problem.deadend_rpns) {
-        if (Evaluator::evaluate(deadend_rpn, current_state, EvalMode::OPTIMISTIC)) {
-            std::cerr << "CRITICAL: Agent has entered a mathematically unrecoverable dead-end." << std::endl;
-            return -2; // Execution failure
-        }
-    }
-
-    // 3. Cache Validation (Precondition Verification)
-    // Verify that the currently planned sequence is still mathematically sound 
-    // given the current world knowledge (which may have collapsed after a recent observation).
-    bool plan_invalid = false;
-    if (next_action_index < plan_queue.size()) {
-        int candidate_action_id = plan_queue[next_action_index];
-        const GroundedAction& candidate_action = global_problem.actions[candidate_action_id];
-
-        // If we are not absolutely certain (PESSIMISTIC) that preconditions hold, 
-        // the cached plan is dangerous and must be discarded.
-        if (!Evaluator::evaluate(candidate_action.precondition_rpn, current_state, EvalMode::PESSIMISTIC)) {
-            plan_invalid = true;
-        }
-    }
-
-    // 4. Replanning Trigger
-    // Triggers if the plan was invalidated by world changes, or if we exhausted our cached queue.
-    if (plan_invalid || next_action_index >= plan_queue.size()) {
-        
-        // Invoke the Z3 Determinization & BFS Pipeline. 
-        // We pass a default sample_size of 5 for witness state generation.
-        plan_queue = compute_linear_plan(belief, global_problem, 5); 
-        next_action_index = 0; // Reset execution pointer to the start of the new plan
-
-        // Handle total planner failure gracefully
-        if (plan_queue.empty()) {
-            std::cerr << "CRITICAL: Planner failed to find a valid robust path from the current state." << std::endl;
-            return -2; // Planning failure
-        }
-    }
-
-    // 5. Action Dispatch and State Machine Locking
-    int action_to_execute = plan_queue[next_action_index];
-    const GroundedAction& act_def = global_problem.actions[action_to_execute];
-
-    if (act_def.observe_predicate_id != -1) {
-        // Sensing Action Dispatch
-        // Lock the engine. We cannot advance the belief state or the next_action_index 
-        // until apply_observation() is called with the physical boolean result.
-        expecting_observation = true;
-        pending_sensing_action_id = action_to_execute;
-    } else {
-        // Standard Action Dispatch
-        // The action is purely physical/manipulative. We compute the subsequent state.
-        PartiallySpecifiedState next_state = current_state;
-        ActionApplier::apply_action(act_def, next_state);
-
-        // Implicit Auto-Observations ---
-        // Scan the predefined list of auto-observable predicates.
-        // If the agent naturally learns this information by being in the new state,
-        // evaluate it and force an immediate epistemic collapse.
-        for (int obs_id : global_problem.auto_observable_predicates) {
-            uint8_t eval_result = Evaluator::evaluate_rpn_raw({obs_id}, next_state);
-            
-            // If the condition is mathematically determinable (True or False)
-            if (eval_result != VAL_UNKNOWN) {
-                next_state.set_known_value(obs_id, eval_result == VAL_TRUE);
-                
-                // Immediately trigger OneOf invariants to deduce further hidden variables
-                bool valid_deduction = next_state.apply_oneof_deductions(global_problem.oneofs);
-                
-                if (!valid_deduction) {
-                    std::cerr << "CRITICAL ERROR: Auto-observation led to a logical contradiction with OneOf invariants." << std::endl;
-                    return -2; 
+// Helper Method: Hunts for an applicable sensing action to force an epistemic collapse
+int SDRPlanner::find_loop_breaking_sensing_action(const PartiallySpecifiedState& current_state) {
+    for (const auto& action : global_problem.actions) {
+        // 1. Is it a sensing action?
+        if (action.observe_predicate_id != -1) {
+            // 2. Does it sense a variable we currently DO NOT know?
+            if (current_state.is_unknown(action.observe_predicate_id)) {
+                // 3. Are we physically capable of executing it right now?
+                if (Evaluator::evaluate(action.precondition_rpn, current_state, EvalMode::PESSIMISTIC)) {
+                    return action.id;
                 }
             }
         }
-        // -------------------------------------------
+    }
+    return -1; // No loop-breaking observation is immediately available
+}
+
+bool SDRPlanner::check_goal(const PartiallySpecifiedState& state) const {
+    // The goal must be mathematically guaranteed. 
+    // PESSIMISTIC mode ensures we don't accidentally assume a goal is met 
+    // due to unresolved VAL_UNKNOWN variables.
+    return Evaluator::evaluate(global_problem.goal_rpn, state, EvalMode::PESSIMISTIC);
+}
+
+bool SDRPlanner::verify_contingent_deadends(const PartiallySpecifiedState& state) const {
+    for (const auto& rpn : global_problem.deadend_rpns) {
         
-        // Push the mutated, fully-collapsed state into our chronological BeliefState history.
-        
-        // Push the mutated state into our chronological BeliefState history.
-        // This maintains the historical graph for future regression safety checks.
-        belief.apply_forward_action(action_to_execute, next_state);
-        
-        // Safely advance to the next action in the cache for the next turn.
-        next_action_index++;
+        // Check 1: Confirmed DeadEnd (VAL_TRUE)
+        // If it evaluates to true under PESSIMISTIC conditions, it is mathematically unavoidable.
+        if (Evaluator::evaluate(rpn, state, EvalMode::PESSIMISTIC)) {
+            return true; 
+        }
+
+        // Check 2: MaybeDeadEnd (VAL_UNKNOWN)
+        // If it evaluates to true under OPTIMISTIC conditions (but failed PESSIMISTIC),
+        // it means the dead-end is possible, but currently obscured by missing knowledge.
+        if (Evaluator::evaluate(rpn, state, EvalMode::OPTIMISTIC)) {
+            // We treat this as a MaybeDeadEnd. According to SDR algorithm rules, 
+            // we do NOT abort the branch. The main execution loop in get_next_action() 
+            // is responsible for catching this epistemic gap and injecting a sensing action.
+            continue; 
+        }
+    }
+    
+    // The agent is safe from all known dead-ends
+    return false;
+}
+
+std::vector<int> SDRPlanner::get_plan_from_solver(const PartiallySpecifiedState& state) const {
+    // This acts as the deliberation phase, querying the classical planner.
+    // It delegates the heavy lifting to the BFSSolver which treats the 
+    // PartiallySpecifiedState as a determinized root node.
+    return BFSSolver::solve(state, global_problem);
+}
+
+int SDRPlanner::get_next_action() {
+    // 0. State Machine Lock Check
+    // Prevent action dispatch while waiting for physical sensor resolution
+    if (expecting_observation) {
+        std::cerr << "CRITICAL: Cannot dispatch action. System is locked waiting for an observation." << std::endl;
+        return -2; // Execution failure
     }
 
-    // Return the integer ID of the action to be translated back to Python/Physical interface
+    // Cache the current epistemic state for fast, read-only evaluations
+    const PartiallySpecifiedState& current_state = belief.get_current_state();
+
+    // 1. Goal Check 
+    // Assumes check_goal() evaluates the global_problem.goal_rpn in PESSIMISTIC mode.
+    if (check_goal(current_state)) {
+        std::cout << "[SDR] Goal reached successfully." << std::endl;
+        return -1; // Standard return code for Goal Achieved
+    }
+
+    // 2. Contingent Dead-End Verification
+    // This now actively injects sensing sub-goals into plan_queue if it hits a MaybeDeadEnd
+    if (handle_contingent_deadends(current_state)) {
+        return -2; // Confirmed failure
+    }
+
+    // 3. Plan Retrieval / Generation
+    int action_to_execute = -1;
+    
+    // If we have exhausted our current plan trajectory, we must replan
+    if (next_action_index >= plan_queue.size()) {
+        plan_queue = get_plan_from_solver(current_state);
+        
+        if (plan_queue.empty()) {
+            std::cerr << "CRITICAL: Classical solver failed to find a path from the current belief state." << std::endl;
+            return -2; // Execution failure
+        }
+        
+        // Reset execution pointer for the new plan
+        next_action_index = 0; 
+    }
+
+    action_to_execute = plan_queue[next_action_index];
+
+    // 4. Physical Cycle Detection & SDR Loop Breaking
+    // Predict the immediate physical result of this action using our stateless applier.
+    PartiallySpecifiedState predicted_next_state = current_state;
+    const GroundedAction& act = global_problem.actions[action_to_execute];
+    ActionApplier::apply_action(act, predicted_next_state);
+
+    // Verify if the agent is about to re-enter an identical physical/epistemic state
+    if (visited_physical_states.find(predicted_next_state) != visited_physical_states.end()) {
+        std::cout << "[SDR] WARNING: Physical cycle detected on action " << action_to_execute << "." << std::endl;
+        
+        int alternative_action = find_loop_breaking_sensing_action(current_state);
+        
+        if (alternative_action != -1) {
+            std::cout << "[SDR] Forcing branching decision: Injecting sensing action " << alternative_action << std::endl;
+            // Override the classical plan to force epistemic collapse
+            plan_queue = { alternative_action };
+            next_action_index = 0;
+            action_to_execute = alternative_action;
+        } else {
+            std::cerr << "CRITICAL: Agent is trapped in a physical loop with no available sensing actions. Aborting." << std::endl;
+            return -2; 
+        }
+    }
+
+    // 5. Dispatch & State Tracking
+    // Record departure state to prevent future cycle regressions. 
+    // StateHasher includes known_mask, so learning new facts clears the cycle footprint.
+    visited_physical_states.insert(current_state);
+    
+    // Advance the execution pointer for the next tick
+    next_action_index++;
+
+    // Lock the planner if this action requires environmental feedback
+    if (global_problem.actions[action_to_execute].observe_predicate_id != -1) {
+        expecting_observation = true;
+    }
+
     return action_to_execute;
 }
 
@@ -276,5 +303,74 @@ std::vector<int> SDRPlanner::compute_linear_plan(
 
     return robust_plan;
 }
+
+int SDRPlanner::plan_to_observe_deadend(const PartiallySpecifiedState& current_state, const std::vector<int>& target_fluents) {
+    // Basic Anti-Looping Mechanism for sensing attempts
+    static std::unordered_map<int, int> sensing_attempt_tracker;
+    const int MAX_SENSING_RETRIES = 3;
+
+    for (int target_fluent : target_fluents) {
+        if (sensing_attempt_tracker[target_fluent] >= MAX_SENSING_RETRIES) {
+            std::cout << "[SDR] WARNING: Reached sensing limit for fluent " << target_fluent << ". Skipping." << std::endl;
+            continue;
+        }
+
+        // 1. Immediate Applicability Check
+        for (const auto& action : global_problem.actions) {
+            if (action.observe_predicate_id == target_fluent) {
+                if (Evaluator::evaluate(action.precondition_rpn, current_state, EvalMode::PESSIMISTIC)) {
+                    sensing_attempt_tracker[target_fluent]++;
+                    return action.id; // Return the immediate sensing action
+                }
+            }
+        }
+    }
+    return -1; // No valid sensing action could be found
+}
+
+bool SDRPlanner::handle_contingent_deadends(const PartiallySpecifiedState& state) {
+    bool maybe_deadend = false;
+    std::vector<int> unknown_deadend_fluents;
+
+    for (const auto& rpn : global_problem.deadend_rpns) {
+        // Check 1: Confirmed DeadEnd (VAL_TRUE)
+        if (Evaluator::evaluate(rpn, state, EvalMode::PESSIMISTIC)) {
+            std::cerr << "CRITICAL: Agent is in a confirmed DeadEndTrue. Aborting." << std::endl;
+            return true; // Unrecoverable failure
+        }
+
+        // Check 2: MaybeDeadEnd (VAL_UNKNOWN)
+        if (Evaluator::evaluate(rpn, state, EvalMode::OPTIMISTIC)) {
+            maybe_deadend = true;
+            
+            // Extract the specific fluents causing the uncertainty
+            for (int token : rpn) {
+                if (token >= 0 && state.is_unknown(token)) {
+                    if (std::find(unknown_deadend_fluents.begin(), unknown_deadend_fluents.end(), token) == unknown_deadend_fluents.end()) {
+                        unknown_deadend_fluents.push_back(token);
+                    }
+                }
+            }
+        }
+    }
+
+    if (maybe_deadend) {
+        std::cout << "[SDR] MaybeDeadEnd detected. Suspending primary plan to resolve uncertainty." << std::endl;
+        int sensing_action_id = plan_to_observe_deadend(state, unknown_deadend_fluents);
+        
+        if (sensing_action_id != -1) {
+            // INJECTION: Override the cached plan and force immediate execution of the sensing path
+            plan_queue = { sensing_action_id };
+            next_action_index = 0;
+            return false; // Not a failure, we successfully recovered
+        } else {
+            std::cerr << "CRITICAL: Agent is in a MaybeDeadEnd but cannot find a valid sensing action to resolve it. Aborting." << std::endl;
+            return true; // Treated as failure if we can't observe it
+        }
+    }
+    
+    return false; // Safe
+}
+
 
 } // namespace CPOR
