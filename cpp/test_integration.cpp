@@ -12,7 +12,7 @@ extern ProblemDef global_problem;
 extern "C" {
     void init_problem(int total_predicates);
     void add_initial_fact(int fact_id);
-    void add_action(int id, int* pre_rpn, int pre_len, int* eff_ids, bool* eff_vals, int eff_len, int obs_id);
+    void add_grounded_action_to_cpp(int action_id, int* pre_rpn, int pre_len, int* eff_facts, bool* eff_vals, int eff_len, int observe_id);
 }
 
 void run_integration_tests() {
@@ -31,7 +31,7 @@ void run_integration_tests() {
     int eff_ids[] = {5}; 
     bool eff_vals[] = {true}; 
     
-    add_action(1, pre_rpn, 1, eff_ids, eff_vals, 1, -1);
+    add_grounded_action_to_cpp(1, pre_rpn, 1, eff_ids, eff_vals, 1, -1);
 
     // Verify the Bridge successfully wrote to C++ memory
     assert(global_problem.total_predicates == 20);
@@ -59,14 +59,14 @@ void run_integration_tests() {
     const GroundedAction& action = global_problem.actions[0];
     
     // Check if the action's RPN is satisfied by the current bitset state
-    bool is_legal = Evaluator::evaluate_rpn(action.precondition_rpn, current_state);
+    bool is_legal = Evaluator::evaluate_rpn_raw(action.precondition_rpn, current_state);
     assert(is_legal == true); // It requires Fact 2 to be true, which it is!
 
 
     // ==============================================================================
     // PHASE 4: EXECUTION (Simulate applying the action's effects)
     // ==============================================================================
-    for (const auto& effect : action.effects) {
+    for (const auto& effect : action.guaranteed_effects) {
         current_state.set_known_value(effect.first, effect.second);
     }
 
