@@ -6,12 +6,16 @@
 #include <vector>
 #include <iostream>
 #include <unordered_set>
+#include <stdint.h> 
 
 ProblemDef global_problem;
 
 extern "C" {
 
     void init_problem(int total_predicates, int total_functions = 0) {
+
+        reset_global_problem();
+        
         global_problem = ProblemDef(); 
         global_problem.total_predicates = total_predicates;
         global_problem.total_functions = total_functions;
@@ -91,24 +95,49 @@ extern "C" {
         std::cout << "======================================" << std::endl;
     }
 
+    void add_oneof_group(int* fact_ids, int length) {
+        std::vector<int> group;
+        for (int i = 0; i < length; ++i) {
+            group.push_back(fact_ids[i]);
+        }
+        global_problem.oneofs.push_back(group);
+    }
+
+    void add_conditional_effect_to_action(int action_id, 
+                                          int* cond_rpn, int cond_len, 
+                                          int* eff_facts, uint8_t* eff_vals, int eff_len) {
+        
+        // Find the action (assuming chronological insertion for speed)
+        for (auto& action : global_problem.actions) {
+            if (action.id == action_id) {
+                ConditionalEffect ce;
+                for (int i = 0; i < cond_len; ++i) ce.condition_rpn.push_back(cond_rpn[i]);
+                for (int i = 0; i < eff_len; ++i) ce.effects.push_back({eff_facts[i], eff_vals[i] != 0});
+                
+                action.conditional_effects.push_back(ce);
+                return;
+            }
+        }
+    }
+
 
 // =====================================================================
     // GLOBAL SOLVER (Persists in memory so Python can read the plan later)
     // =====================================================================
-    CPORSolver* global_solver = nullptr;
+    CPOR::CPORSolver* global_solver = nullptr;
 
     bool solve_native() {
         std::cout << "\n=== Starting Native CPOR AND/OR Search ===" << std::endl;
         
         if (global_solver) delete global_solver;
-        global_solver = new CPORSolver();
+        global_solver = new CPOR::CPORSolver();
         
         PartiallySpecifiedState initial_state(global_problem.total_predicates, global_problem.total_functions);
         
-        // --- ADD THESE 3 LINES: Closed World Assumption ---
+        // --- OWA INITIALIZATION: Everything is UNKNOWN by default ---
         int blocks = (global_problem.total_predicates / 64) + 1;
-        initial_state.known_mask.assign(blocks, ~0ULL); // הכל מסומן כידוע
-        initial_state.value_mask.assign(blocks, 0);     // הכל שקר כברירת מחדל
+        initial_state.known_mask.assign(blocks, 0ULL); 
+        initial_state.value_mask.assign(blocks, 0ULL);
         // --------------------------------------------------
 
         // 1. EXPLICITLY TRUE FACTS
@@ -215,8 +244,9 @@ extern "C" {
     // ==================================================================
     // NEW POC API: Adds a full action with RPN preconditions and effects
     // ==================================================================
-    void add_grounded_action_to_cpp(int action_id, int* pre_rpn, int pre_len, 
-                                    int* eff_facts, bool* eff_vals, int eff_len, 
+    void add_grounded_action_to_cpp(int action_id, 
+                                    int* pre_rpn, int pre_len, 
+                                    int* eff_facts, uint8_t* eff_vals, int eff_len, 
                                     int observe_id) {
         GroundedAction action;
         action.id = action_id;
@@ -227,27 +257,52 @@ extern "C" {
         }
         
         for (int i = 0; i < eff_len; ++i) {
-            action.guaranteed_effects.push_back({eff_facts[i], eff_vals[i]});
+            action.guaranteed_effects.push_back({eff_facts[i], eff_vals[i] != 0});
         }
         
+        // Push the base action. Conditional effects will be added via a separate call.
         global_problem.actions.push_back(action);
     }
 
-    // ==================================================================
+    /// ==================================================================
     // NEW POC API: Executes simple BFS and returns path of action IDs
     // ==================================================================
     int solve_poc_bfs(int* out_action_ids, int max_length) {
-        BFSSolver solver;
-        std::vector<int> plan = solver.solve();
         
+        // 1. Construct the Initial Epistemic State for the Classical Search
+        // We must define this here instead of inside the solver so the solver 
+        // remains stateless and usable for mid-execution replanning.
+        PartiallySpecifiedState initial_state(global_problem.total_predicates);
+        
+        int blocks = (global_problem.total_predicates / 64) + 1;
+        
+        // For a purely classical BFS POC, we assume total observability at T=0
+        initial_state.known_mask.assign(blocks, ~0ULL); // All variables are known
+        initial_state.value_mask.assign(blocks, 0);     // Default all to false
+
+        // Inject initial true facts
+        for (int id : global_problem.initial_true_facts) {
+            initial_state.value_mask[id / 64] |= (1ULL << (id % 64));
+        }
+        
+        // Inject initial false facts
+        for (int id : global_problem.initial_false_facts) {
+            initial_state.value_mask[id / 64] &= ~(1ULL << (id % 64));
+        }
+
+        // 2. Call the newly architected static DOD solver
+        std::vector<int> plan = CPOR::BFSSolver::solve(initial_state, global_problem);
+        
+        // 3. Process the output
         if (plan.empty()) {
-            return -1;
+            return -1; // Unsolvable or already at goal
         }
         
         int len = std::min((int)plan.size(), max_length);
         for (int i = 0; i < len; ++i) {
             out_action_ids[i] = plan[i];
         }
+        
         return len;
     }
 } // End of extern "C"

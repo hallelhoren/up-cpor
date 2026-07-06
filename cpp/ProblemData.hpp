@@ -114,4 +114,16 @@ struct ProblemDef {
     std::vector<std::vector<int>> deadend_rpns{};
 
     std::vector<int> auto_observable_predicates;
+
 };
+
+inline ProblemDef& get_global_problem() {
+        static ProblemDef instance;
+        return instance;
+    }
+
+    // 2. THE CTYPES LIFECYCLE PROTECTOR
+    // Forces a total wipe of the domain memory between PDDL runs.
+    inline void reset_global_problem() {
+        get_global_problem() = ProblemDef(); 
+    }

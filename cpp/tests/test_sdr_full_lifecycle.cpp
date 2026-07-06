@@ -28,11 +28,14 @@ constexpr int P_HAS_KEY = 3;
 constexpr int P_GOAL_REACHED = 4;
 
 void init_contingent_problem() {
-    global_problem = ProblemDef();
-    global_problem.total_predicates = 5;
+
+    reset_global_problem();
+    ProblemDef& global_problem = get_global_problem();
+
+    get_global_problem().total_predicates = 5;
     
-    int blocks = (global_problem.total_predicates / 64) + 1;
-    global_problem.comparable_mask.assign(blocks, ~0ULL); // Enable hashing
+    int blocks = (get_global_problem().total_predicates / 64) + 1;
+    get_global_problem().comparable_mask.assign(blocks, ~0ULL); // Enable hashing
 
     // ---------------------------------------------------------
     // Define Actions
@@ -66,22 +69,22 @@ void init_contingent_problem() {
     move_b_a.guaranteed_effects.push_back({P_LOC_B, false});
     move_b_a.guaranteed_effects.push_back({P_LOC_A, true});
 
-    global_problem.actions = { move_a_b, sense_door, move_b_a };
+    get_global_problem().actions = { move_a_b, sense_door, move_b_a };
 
     // ---------------------------------------------------------
     // Define Contingent Dead-End
     // ---------------------------------------------------------
     // Formula: NOT DOOR_OPEN AND NOT HAS_KEY (If door closed & no key, we are dead)
-    global_problem.deadend_rpns.push_back({ P_DOOR_OPEN, OP_NOT, P_HAS_KEY, OP_NOT, OP_AND });
-    global_problem.goal_rpn = { P_GOAL_REACHED };
+    get_global_problem().deadend_rpns.push_back({ P_DOOR_OPEN, OP_NOT, P_HAS_KEY, OP_NOT, OP_AND });
+    get_global_problem().goal_rpn = { P_GOAL_REACHED };
 }
 
 void test_z3_manager_sampling() {
     std::cout << "--- Testing Z3Manager & Sampler ---" << std::endl;
-    PartiallySpecifiedState s0(global_problem.total_predicates);
+    PartiallySpecifiedState s0(get_global_problem().total_predicates);
     
     // Add a Global OneOf Invariant: (DOOR_OPEN XOR HAS_KEY)
-    global_problem.oneofs.push_back({P_DOOR_OPEN, P_HAS_KEY});
+    get_global_problem().oneofs.push_back({P_DOOR_OPEN, P_HAS_KEY});
     
     s0.set_known_value(P_LOC_A, true);
     // P_DOOR_OPEN and P_HAS_KEY remain implicitly UNKNOWN
@@ -97,13 +100,13 @@ void test_z3_manager_sampling() {
     }
     
     // Clean up mock invariant for remaining tests
-    global_problem.oneofs.clear();
+    get_global_problem().oneofs.clear();
     std::cout << "[PASS] Z3Manager correctly instantiated and sampled diverse concrete states respecting OneOfs." << std::endl;
 }
 
 void test_conditional_regression() {
     std::cout << "--- Testing Conditional Effects Regression ---" << std::endl;
-    PartiallySpecifiedState s0(global_problem.total_predicates);
+    PartiallySpecifiedState s0(get_global_problem().total_predicates);
     s0.set_known_value(P_LOC_A, true);
     s0.set_known_value(P_DOOR_OPEN, true); // We KNOW the door is open
 
@@ -111,7 +114,7 @@ void test_conditional_regression() {
     
     // Simulate applying MOVE_A_B
     PartiallySpecifiedState s1 = s0;
-    ActionApplier::apply_action(global_problem.actions[0], s1);
+    ActionApplier::apply_action(get_global_problem().actions[0], s1);
     belief.apply_forward_action(0, s1);
 
     // Regress GOAL_REACHED backward through history
@@ -128,7 +131,7 @@ void test_conditional_regression() {
 void test_sdr_deadend_recovery() {
     std::cout << "--- Testing MaybeDeadEnd Sub-Goal Injection ---" << std::endl;
     
-    PartiallySpecifiedState s0(global_problem.total_predicates);
+    PartiallySpecifiedState s0(get_global_problem().total_predicates);
     s0.set_known_value(P_LOC_A, true);
     s0.set_known_value(P_HAS_KEY, false); // We definitely do NOT have the key
     // DOOR_OPEN is UNKNOWN. 
@@ -149,7 +152,7 @@ void test_sdr_deadend_recovery() {
 void test_physical_cycle_detection() {
     std::cout << "--- Testing Physical Cycle Detection & Loop Breaking ---" << std::endl;
     
-    PartiallySpecifiedState s0(global_problem.total_predicates);
+    PartiallySpecifiedState s0(get_global_problem().total_predicates);
     s0.set_known_value(P_LOC_A, true);
 
     s0.set_known_value(P_HAS_KEY, true);
@@ -163,7 +166,7 @@ void test_physical_cycle_detection() {
     
     // Update belief state (Agent is now at B)
     PartiallySpecifiedState s1 = s0;
-    ActionApplier::apply_action(global_problem.actions[0], s1);
+    ActionApplier::apply_action(get_global_problem().actions[0], s1);
     planner.get_mutable_belief().apply_forward_action(0, s1);
 
     // 2. Force return move (B -> A)
@@ -173,7 +176,7 @@ void test_physical_cycle_detection() {
     
     // Update belief state (Agent physically returned to A)
     PartiallySpecifiedState s2 = s1;
-    ActionApplier::apply_action(global_problem.actions[2], s2);
+    ActionApplier::apply_action(get_global_problem().actions[2], s2);
     planner.get_mutable_belief().apply_forward_action(2, s2);
 
     // 3. The cycle trigger

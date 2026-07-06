@@ -1,9 +1,12 @@
 #include "SDRSampler.hpp"
+#include "Z3Manager.hpp"
 #include <z3++.h>
 #include <string>
-#include <stdexcept>
 
 namespace CPOR {
+
+// Thread-local storage ensures lock-free performance in a multi-threaded heuristic search
+thread_local Z3Manager g_z3_manager;
 
 std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
     const PartiallySpecifiedState& current_belief,
@@ -13,39 +16,25 @@ std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
     std::vector<PartiallySpecifiedState> sampled_states;
     if (target_sample_count <= 0) return sampled_states;
 
-    // 1. Initialize Z3 Context
-    z3::context ctx;
-    z3::solver solver(ctx);
+    // 1. Initialize Z3 Manager (Fast exit if already initialized)
+    g_z3_manager.initialize(global_problem);
 
-    std::vector<z3::expr> fluent_vars;
-    fluent_vars.reserve(global_problem.total_predicates);
+    z3::context& ctx = g_z3_manager.ctx;
+    z3::solver& solver = g_z3_manager.solver;
+    const std::vector<z3::expr>& fluent_vars = g_z3_manager.fluent_vars;
 
-    // Create Z3 Boolean Variables
-    for (int i = 0; i < global_problem.total_predicates; ++i) {
-        std::string var_name = "f_" + std::to_string(i);
-        fluent_vars.push_back(ctx.bool_const(var_name.c_str()));
-    }
+    // 2. Scope the Solver State
+    // Pushes a new frame onto the solver stack. Everything added after this 
+    // will be erased when pop() is called.
+    solver.push();
 
-    // 2. Assert Known Facts
+    // 3. Assert Known Epistemic Facts for THIS specific evaluation
     for (int i = 0; i < global_problem.total_predicates; ++i) {
         if (!current_belief.is_unknown(i)) {
-            if (current_belief.is_true(i)) solver.add(fluent_vars[i]);
-            else solver.add(!fluent_vars[i]);
-        }
-    }
-
-    // 3. Assert OneOf Invariants
-    for (const auto& oneof_group : global_problem.oneofs) {
-        if (oneof_group.empty()) continue;
-        z3::expr_vector group_vars(ctx);
-        for (int fluent_id : oneof_group) {
-            group_vars.push_back(fluent_vars[fluent_id]);
-        }
-        
-        solver.add(z3::mk_or(group_vars)); // At least one true
-        for (size_t i = 0; i < oneof_group.size(); ++i) {
-            for (size_t j = i + 1; j < oneof_group.size(); ++j) {
-                solver.add(!(fluent_vars[oneof_group[i]] && fluent_vars[oneof_group[j]])); // Mutually exclusive
+            if (current_belief.is_true(i)) {
+                solver.add(fluent_vars[i]);
+            } else {
+                solver.add(!fluent_vars[i]);
             }
         }
     }
@@ -53,7 +42,7 @@ std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
     // 4. Sample and Block (Diverse Generation)
     for (int k = 0; k < target_sample_count; ++k) {
         if (solver.check() != z3::sat) {
-            break; // No more valid models
+            break; // No more valid models exist under current constraints
         }
 
         z3::model model = solver.get_model();
@@ -63,6 +52,7 @@ std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
         for (int i = 0; i < global_problem.total_predicates; ++i) {
             z3::expr var = fluent_vars[i];
             bool is_true = model.eval(var, true).is_true();
+            
             concrete_state.set_known_value(i, is_true);
 
             // Force solver to pick a different assignment for unknown bits next time
@@ -74,13 +64,19 @@ std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
 
         sampled_states.push_back(concrete_state);
 
+        // Add the blocking clause to the current scope so we don't sample this reality again
         if (!blocking_clause.empty()) {
             solver.add(z3::mk_or(blocking_clause));
         } else {
-            // Strictly deterministic space, cannot generate diverse states
+            // Space is strictly deterministic; no diverse states can be generated
             break; 
         }
     }
+
+    // 5. Clean up the Solver Stack
+    // This instantly wipes the belief assertions and blocking clauses from Z3's memory,
+    // leaving the OneOf invariants completely intact at depth 0.
+    solver.pop();
 
     return sampled_states;
 }

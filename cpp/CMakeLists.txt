@@ -22,7 +22,7 @@ set_source_files_properties(${FF_SOURCES} PROPERTIES COMPILE_FLAGS "-w -fcommon"
 
 # Create your C++ Library (Now including ff_globals.c!)
 add_library(cpor_core SHARED 
-    native_bridge.cpp FFSolver.cpp SDRSampler.cpp 
+    native_bridge.cpp CPORSolver.cpp FFSolver.cpp SDRSampler.cpp 
     SDRPlanner.cpp BeliefState.cpp ff_globals.c
 )
 
