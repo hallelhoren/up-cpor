@@ -1,20 +1,26 @@
-import os
 import ctypes
+import os
+from typing import List, Dict, Any
 
-def get_lib_path():
-    # Attempt to locate the compiled C++ core library
-    #BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    BASE_DIR = "/mnt/c/Users/97258/Desktop/technion/semester6/clairProject"
-    # Adjust this path based on where your build.sh actually puts the .so file
-    LIB_PATH = os.path.join(BASE_DIR, "cpp", "build", "libcpor_core.so")
+def get_lib_path() -> str:
+    """Resolve the native CPOR shared library path."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_paths = [
+        os.path.join(base_dir, "..", "libcpor_core.so"),
+        os.path.join(base_dir, "..", "build", "libcpor_core.so"),
+        os.path.join(base_dir, "cpp", "build", "libcpor_core.so"),
+    ]
 
-    if not os.path.exists(LIB_PATH):
-        print(f"WARNING: Native library not found at {LIB_PATH}. Please compile using CMake.")
-        raise FileNotFoundError(f"Could not find libcpor_core.so. Looked in: {LIB_PATH}")
-    else:
-        return ctypes.CDLL(LIB_PATH)
+    for path in possible_paths:
+        normalized = os.path.abspath(path)
+        if os.path.exists(normalized):
+            return normalized
 
-cpor_lib = get_lib_path()
+    searched = ", ".join(os.path.abspath(path) for path in possible_paths)
+    raise FileNotFoundError(f"Could not find libcpor_core.so. Looked in: {searched}")
+
+_LIB_PATH = get_lib_path()
+cpor_lib = ctypes.CDLL(_LIB_PATH)
 
 # ---------------------------------------------------------
 # Define Strict ctypes Signatures (ABI Security)
@@ -22,88 +28,166 @@ cpor_lib = get_lib_path()
 cpor_lib.init_problem.argtypes = [ctypes.c_int, ctypes.c_int]
 cpor_lib.add_initial_fact.argtypes = [ctypes.c_int]
 cpor_lib.add_initial_false_fact.argtypes = [ctypes.c_int]
+cpor_lib.add_initial_function_value.argtypes = [ctypes.c_int, ctypes.c_double]
 cpor_lib.set_goal_rpn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
-
-# NEW: OneOf Endpoint
 cpor_lib.add_oneof_group.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+cpor_lib.create_action.argtypes = [
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_int,
+]
+cpor_lib.add_guaranteed_effect.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_bool]
+cpor_lib.add_conditional_effect.argtypes = [
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_bool,
+]
+cpor_lib.add_nondeterministic_effect.argtypes = [ctypes.c_int, ctypes.c_int]
+cpor_lib.add_oneof_constraint.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+cpor_lib.add_deadend_rpn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+cpor_lib.add_nondeterministic_effect.argtypes = [ctypes.c_int, ctypes.c_int]
 
-# UPDATED: c_bool replaced with c_uint8
+# CRITICAL FIX: Replaced c_bool with c_uint8 for safe memory alignment
 cpor_lib.add_grounded_action_to_cpp.argtypes = [
-    ctypes.c_int, 
-    ctypes.POINTER(ctypes.c_int), ctypes.c_int, 
-    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint8), ctypes.c_int, 
-    ctypes.c_int 
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
+    ctypes.c_int,
 ]
 
-# NEW: Conditional Effect Endpoint
 cpor_lib.add_conditional_effect_to_action.argtypes = [
     ctypes.c_int,
     ctypes.POINTER(ctypes.c_int), ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint8), ctypes.c_int
+    ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_uint8), ctypes.c_int,
 ]
 
+# Getters
+cpor_lib.solve_poc_bfs.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+cpor_lib.solve_poc_bfs.restype = ctypes.c_int
+cpor_lib.solve_native.argtypes = []
+cpor_lib.solve_native.restype = ctypes.c_bool
+cpor_lib.get_chosen_action.argtypes = [ctypes.c_int]
+cpor_lib.get_chosen_action.restype = ctypes.c_int
+cpor_lib.get_single_child.argtypes = [ctypes.c_int]
+cpor_lib.get_single_child.restype = ctypes.c_int
+cpor_lib.get_true_child.argtypes = [ctypes.c_int]
+cpor_lib.get_true_child.restype = ctypes.c_int
+cpor_lib.get_false_child.argtypes = [ctypes.c_int]
+cpor_lib.get_false_child.restype = ctypes.c_int
+cpor_lib.get_root_node_index.argtypes = []
+cpor_lib.get_root_node_index.restype = ctypes.c_int
+cpor_lib.get_node_info.argtypes = [
+    ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+    ctypes.POINTER(ctypes.c_int),
+]
+cpor_lib.get_node_info.restype = None
+
 # ---------------------------------------------------------
-# The Loader Function
+# The Data Dispatcher (Safe C-Serialization)
 # ---------------------------------------------------------
-def load_problem_to_cpp(grounded_data):
-    print("[NativeAPI] Initializing C++ Problem...")
-    cpor_lib.init_problem(grounded_data['total_predicates'], 0)
-    
-    # 1. Load Initial State Facts
+def load_problem_to_cpp(grounded_data: Dict[str, Any]) -> None:
+    print("[NativeAPI] Initializing C++ Environment...")
+    cpor_lib.init_problem(grounded_data['total_predicates'], grounded_data.get('total_functions', 0))
+
+    # Load Initial State
     for fact in grounded_data['initial_true']:
         cpor_lib.add_initial_fact(fact)
     for fact in grounded_data['initial_false']:
         cpor_lib.add_initial_false_fact(fact)
+    for func in grounded_data.get('initial_functions', []):
+        cpor_lib.add_initial_function_value(func['id'], ctypes.c_double(func['val']))
 
-    # 2. NEW: Load OneOf Invariants
-    if 'oneofs' in grounded_data:
-        for group in grounded_data['oneofs']:
-            c_group = (ctypes.c_int * len(group))(*group)
-            cpor_lib.add_oneof_group(c_group, len(group))
-        
-    print(f"[NativeAPI] Pushing {len(grounded_data['actions'])} actions to C++...")
-    
-    # 3. Load Actions
-    for act in grounded_data['actions']:
-        rpn = act['pre_rpn']
-        facts = act['eff_facts']
-        vals = act['eff_vals']
-        observe_id = act.get('observe_id', -1)
-        
+    # Load Constraints
+    for group in grounded_data.get('oneofs', []):
+        c_group = (ctypes.c_int * len(group))(*group)
+        cpor_lib.add_oneof_group(c_group, len(group))
+
+    for rpn in grounded_data.get('deadends', []):
         c_rpn = (ctypes.c_int * len(rpn))(*rpn)
-        c_facts = (ctypes.c_int * len(facts))(*facts)
-        
-        # CRITICAL FIX: Cast booleans to 1-byte uint8_t integers
-        c_vals = (ctypes.c_uint8 * len(vals))(*[1 if v else 0 for v in vals])
-        
-        # Push the Base Action
+        cpor_lib.add_deadend_rpn(c_rpn, len(rpn))
+
+    # Load Actions
+    print(f"[NativeAPI] Pushing {len(grounded_data['actions'])} actions to C++...")
+    for act in grounded_data['actions']:
+        pre_rpn = act['pre_rpn']
+        eff_facts = act['eff_facts']
+        eff_vals = act['eff_vals']
+
+        c_pre = (ctypes.c_int * len(pre_rpn))(*pre_rpn)
+        c_facts = (ctypes.c_int * len(eff_facts))(*eff_facts)
+        c_vals = (ctypes.c_uint8 * len(eff_vals))(*[1 if v else 0 for v in eff_vals])
+
         cpor_lib.add_grounded_action_to_cpp(
-            act['id'], 
-            c_rpn, len(rpn), 
-            c_facts, c_vals, len(facts), 
-            observe_id
+            act['id'],
+            c_pre, len(pre_rpn),
+            c_facts, c_vals, len(eff_facts),
+            act['observe_id']
         )
 
-        # 4. NEW: Push Conditional Effects
-        if 'conditional_effects' in act:
-            for ce in act['conditional_effects']:
-                cond_rpn = ce['condition_rpn']
-                ce_facts = ce['eff_facts']
-                ce_vals = ce['eff_vals']
+        for ce in act.get('conditional_effects', []):
+            cond_rpn = ce['condition_rpn']
+            ce_facts = ce['eff_facts']
+            ce_vals = ce['eff_vals']
 
-                c_cond_rpn = (ctypes.c_int * len(cond_rpn))(*cond_rpn)
-                c_ce_facts = (ctypes.c_int * len(ce_facts))(*ce_facts)
-                c_ce_vals = (ctypes.c_uint8 * len(ce_vals))(*[1 if v else 0 for v in ce_vals])
+            c_cond = (ctypes.c_int * len(cond_rpn))(*cond_rpn)
+            c_ce_facts = (ctypes.c_int * len(ce_facts))(*ce_facts)
+            c_ce_vals = (ctypes.c_uint8 * len(ce_vals))(*[1 if v else 0 for v in ce_vals])
 
-                cpor_lib.add_conditional_effect_to_action(
-                    act['id'],
-                    c_cond_rpn, len(cond_rpn),
-                    c_ce_facts, c_ce_vals, len(ce_facts)
-                )
-        
-    # 5. Load Goal
-    goal_rpn = grounded_data['goal_rpn']
-    c_goal = (ctypes.c_int * len(goal_rpn))(*goal_rpn)
-    cpor_lib.set_goal_rpn(c_goal, len(goal_rpn))
+            cpor_lib.add_conditional_effect_to_action(
+                act['id'],
+                c_cond, len(cond_rpn),
+                c_ce_facts, c_ce_vals, len(ce_facts)
+            )
 
-    print("[NativeAPI] C++ Environment successfully initialized.")
+        for nd_fact in act.get('non_deterministic_effects', []):
+            cpor_lib.add_nondeterministic_effect(act['id'], nd_fact)
+
+    # Load Goals
+    goal_rpn = grounded_data.get('goal_rpn', [])
+    if goal_rpn:
+        c_goal = (ctypes.c_int * len(goal_rpn))(*goal_rpn)
+        cpor_lib.set_goal_rpn(c_goal, len(goal_rpn))
+
+    print("[NativeAPI] Transfer complete.")
+
+# ---------------------------------------------------------
+# Exposed Helper Methods
+# ---------------------------------------------------------
+def print_problem_stats() -> None:
+    cpor_lib.print_problem_stats()
+
+def solve_poc_bfs(max_len: int = 1000) -> List[int]:
+    out_array = (ctypes.c_int * max_len)()
+    plan_length = cpor_lib.solve_poc_bfs(out_array, max_len)
+    if plan_length < 0:
+        return []
+    return [out_array[i] for i in range(plan_length)]
+
+def solve_native() -> bool:
+    return bool(cpor_lib.solve_native())
+
+def get_chosen_action(node_idx: int) -> int:
+    return cpor_lib.get_chosen_action(node_idx)
+
+def get_single_child(node_idx: int) -> int:
+    return cpor_lib.get_single_child(node_idx)
+
+def get_true_child(node_idx: int) -> int:
+    return cpor_lib.get_true_child(node_idx)
+
+def get_false_child(node_idx: int) -> int:
+    return cpor_lib.get_false_child(node_idx)
+
+def get_root_node_index() -> int:
+    return cpor_lib.get_root_node_index()
+
+def get_node_info(node_idx: int, action_id, observe_id, num_children, children_indices, children_obs_values) -> None:
+    cpor_lib.get_node_info(node_idx, action_id, observe_id, num_children, children_indices, children_obs_values)

@@ -1,14 +1,11 @@
-from unified_planning.engines import Credits, MetaEngine, Engine
+from unified_planning.engines import Credits, Engine
 from unified_planning.plans import ContingentPlan
-import unified_planning.engines.mixins as mixins
 from unified_planning.engines.mixins.oneshot_planner import OneshotPlannerMixin
-from unified_planning.engines.mixins.action_selector import ActionSelectorMixin
 from unified_planning.engines.mixins.compiler import CompilationKind
 import unified_planning as up
 from unified_planning.model import ProblemKind, AbstractProblem
 from unified_planning.model.contingent.contingent_problem import ContingentProblem
 from unified_planning.engines.results import PlanGenerationResultStatus, PlanGenerationResult
-from up_cpor.converter import UpCporConverter
 
 from typing import Type, IO, Optional, Callable, Dict
 
@@ -17,14 +14,7 @@ def _coerce_random_seed(random_seed: Optional[int]) -> Optional[int]:
     return None if random_seed is None else int(random_seed)
 
 
-CPORCredits = Credits('CPOR (C++ Native Core)',
-                     'Guy Shani',
-                     'shanigu@bgu.ac.il',
-                     'https://github.com/guyazran/up-cpor',
-                     '',
-                     'CPOR High-Performance implementation.',
-                     'Migrated to modern C++ with Data-Oriented Design (Bitsets/RPN).'
-)
+CPORCredits = None
 
 
 class CPORImpl(Engine, OneshotPlannerMixin):
@@ -34,7 +24,6 @@ class CPORImpl(Engine, OneshotPlannerMixin):
         up.engines.mixins.OneshotPlannerMixin.__init__(self)
         self.bOnline = bOnline
         self._skip_checks = False
-        self.cnv = UpCporConverter()
         self.random_seed = _coerce_random_seed(random_seed)
 
     @property
@@ -78,7 +67,9 @@ class CPORImpl(Engine, OneshotPlannerMixin):
         assert isinstance(problem, ContingentProblem)
         
         # =====================================================================
-        # Pure C++ Pipeline Router
+        # Orchestration only.
+        # Grounding SSoT: up_cpor.problem_grounder.extract_grounded_problem_data.
+        # Native interop SSoT: up_cpor.native_api.
         # =====================================================================
         problem_name = getattr(problem, 'name', '').lower()
         if "blocks" in problem_name or "bw-rand" in problem_name:
