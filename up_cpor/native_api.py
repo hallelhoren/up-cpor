@@ -70,6 +70,10 @@ cpor_lib.solve_poc_bfs.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
 cpor_lib.solve_poc_bfs.restype = ctypes.c_int
 cpor_lib.solve_native.argtypes = []
 cpor_lib.solve_native.restype = ctypes.c_bool
+cpor_lib.solve_native_cpor_loop.argtypes = []
+cpor_lib.solve_native_cpor_loop.restype = ctypes.c_bool
+cpor_lib.get_cpor_loop_fallback_count.argtypes = []
+cpor_lib.get_cpor_loop_fallback_count.restype = ctypes.c_int
 cpor_lib.get_chosen_action.argtypes = [ctypes.c_int]
 cpor_lib.get_chosen_action.restype = ctypes.c_int
 cpor_lib.get_single_child.argtypes = [ctypes.c_int]
@@ -173,6 +177,21 @@ def solve_poc_bfs(max_len: int = 1000) -> List[int]:
 
 def solve_native() -> bool:
     return bool(cpor_lib.solve_native())
+
+def solve_native_cpor_loop() -> bool:
+    """Opt-in entry point for the stack-based CPOR outer loop
+    (CPORSolver::solve_cpor_loop), kept separate from solve_native() so nothing
+    that already calls solve_native() (problem_grounder.py's default path) is
+    affected. Populates the same node_pool extraction contract, so
+    get_chosen_action/get_single_child/get_true_child/get_false_child/
+    get_root_node_index all work unchanged against a tree built this way."""
+    return bool(cpor_lib.solve_native_cpor_loop())
+
+def get_cpor_loop_fallback_count() -> int:
+    """How many times the most recent solve_native_cpor_loop() call had to
+    invoke the layered fallback (Option 1) to CPORSolver::solve_from_node.
+    Only meaningful immediately after a solve_native_cpor_loop() call."""
+    return cpor_lib.get_cpor_loop_fallback_count()
 
 def get_chosen_action(node_idx: int) -> int:
     return cpor_lib.get_chosen_action(node_idx)

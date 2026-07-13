@@ -16,10 +16,6 @@
 
 using namespace CPOR;
 
-// Global Context Required by the Engine
-ProblemDef global_problem;
-
-
 // Domain Predicates
 constexpr int P_LOC_A = 0;
 constexpr int P_LOC_B = 1;
@@ -30,7 +26,6 @@ constexpr int P_GOAL_REACHED = 4;
 void init_contingent_problem() {
 
     reset_global_problem();
-    ProblemDef& global_problem = get_global_problem();
 
     get_global_problem().total_predicates = 5;
     
@@ -89,7 +84,7 @@ void test_z3_manager_sampling() {
     s0.set_known_value(P_LOC_A, true);
     // P_DOOR_OPEN and P_HAS_KEY remain implicitly UNKNOWN
 
-    std::vector<PartiallySpecifiedState> samples = SDRSampler::sample_concrete_states(s0, global_problem, 5);
+    std::vector<PartiallySpecifiedState> samples = SDRSampler::sample_concrete_states(s0, get_global_problem(), 5);
     
     assert(!samples.empty());
     for (const auto& sample : samples) {
@@ -120,7 +115,7 @@ void test_conditional_regression() {
     // Regress GOAL_REACHED backward through history
     std::vector<int> target_rpn = { P_GOAL_REACHED };
     
-    bool is_safely_true = belief.verify_condition_safely(target_rpn, global_problem);
+    bool is_safely_true = belief.verify_condition_safely(target_rpn, get_global_problem());
     
     // Because DOOR was OPEN in historical state s0, the conditional effect triggered.
     // The regression engine MUST deduce this as TRUE.
@@ -140,7 +135,7 @@ void test_sdr_deadend_recovery() {
     // (!DOOR_OPEN AND !HAS_KEY) evaluates to VAL_UNKNOWN.
     // It is a MaybeDeadEnd. The planner MUST trigger a sensing action.
 
-    SDRPlanner planner(s0, global_problem);
+    SDRPlanner planner(s0, get_global_problem());
     int action_to_execute = planner.get_next_action();
 
     // The planner should have dynamically injected Action 1 (SENSE_DOOR) 
@@ -157,7 +152,7 @@ void test_physical_cycle_detection() {
 
     s0.set_known_value(P_HAS_KEY, true);
     
-    SDRPlanner planner(s0, global_problem);
+    SDRPlanner planner(s0, get_global_problem());
     
     // 1. Force first move (A -> B)
     planner.set_plan_queue({0}); // Action 0 is MOVE_A_B

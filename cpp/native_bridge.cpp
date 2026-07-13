@@ -1,22 +1,32 @@
 #include "ProblemData.hpp"
 #include "State.hpp"
 #include "Evaluator.hpp"
-#include "CPORSolver.hpp" 
+#include "CPORSolver.hpp"
 #include "BFSSolver.hpp"
+#include "FFBridge.hpp"
+#include "SDRSampler.hpp"
+#include "DeadEndManager.hpp"
 #include <vector>
 #include <iostream>
 #include <unordered_set>
-#include <stdint.h> 
-
-ProblemDef global_problem;
+#include <stdint.h>
 
 extern "C" {
 
     void init_problem(int total_predicates, int total_functions = 0) {
 
         reset_global_problem();
+        // A thread may have already solved a different problem before this
+        // call (e.g. sequential test cases in one process) -- the SDR
+        // sampler's thread-local Z3 state was built for that old problem's
+        // predicate count and oneof/deadend constraints, so it must be
+        // discarded before this new problem's facts/actions are loaded.
+        CPOR::SDRSampler::reset_z3_state();
+        // dead_end_cache is keyed purely on state bitmask content with no
+        // problem identity -- see the comment on reset_for_new_problem() --
+        // so it must be invalidated alongside the Z3 state above.
+        CPOR::DeadEndManager::reset_for_new_problem();
 
-        global_problem = get_global_problem();; 
         get_global_problem().total_predicates = total_predicates;
         get_global_problem().total_functions = total_functions;
 
@@ -126,17 +136,17 @@ extern "C" {
     // =====================================================================
     CPOR::CPORSolver* global_solver = nullptr;
 
-    bool solve_native() {
-        std::cout << "\n=== Starting Native CPOR AND/OR Search ===" << std::endl;
-        
-        if (global_solver) delete global_solver;
-        global_solver = new CPOR::CPORSolver();
-
+    // Shared by solve_native() and solve_native_cpor_loop(): both algorithms
+    // must start from an identically-constructed initial belief for a
+    // meaningful pytest comparison between them, so this is factored out
+    // rather than duplicated (unlike solve_poc_bfs's simpler, fully-observable
+    // variant below, which is deliberately a different, classical-only setup).
+    static PartiallySpecifiedState build_owa_initial_state() {
         PartiallySpecifiedState initial_state(get_global_problem().total_predicates, get_global_problem().total_functions);
-        
+
         // --- OWA INITIALIZATION: Everything is UNKNOWN by default ---
         int blocks = (get_global_problem().total_predicates / 64) + 1;
-        initial_state.known_mask.assign(blocks, 0ULL); 
+        initial_state.known_mask.assign(blocks, 0ULL);
         initial_state.value_mask.assign(blocks, 0ULL);
         // --------------------------------------------------
 
@@ -156,21 +166,31 @@ extern "C" {
                 initial_state.set_unknown(fact_id);
             }
         }
-        
-        //  Observable facts are UNKNOWN.
-        // If an action senses a fact, that fact is inherently a hidden variable.
-        //for (const auto& action : get_global_problem().actions) {
-        //    if (action.observe_predicate_id != -1) {
-        //        int obs = action.observe_predicate_id;
-        //        initial_state.known_mask[obs / 64] &= ~(1ULL << (obs % 64)); // Force to Unknown
-        //    }
-        //}
+
+        return initial_state;
+    }
+
+    bool solve_native() {
+        std::cout << "\n=== Starting Native CPOR AND/OR Search ===" << std::endl;
+
+        if (global_solver) delete global_solver;
+        global_solver = new CPOR::CPORSolver();
+
+        PartiallySpecifiedState initial_state = build_owa_initial_state();
+
+        // Build FF's connectivity graph once for this problem load. CPORSolver's
+        // heuristic prefers it when available and falls back to a bounded BFS
+        // otherwise (see CPORSolver::compute_heuristic) -- never used partially.
+        bool ff_ready = CPOR::FFBridge::build(get_global_problem());
+        std::cout << "[FF] Relaxed-planning-graph heuristic "
+                  << (ff_ready ? "available for this problem." : "not usable for this problem (falling back to bounded BFS heuristic).")
+                  << std::endl;
 
         int root_idx = global_solver->create_root_node(initial_state);
-        
+
         // Pass an initially empty set to track the current search path for cycle detection
         std::vector<int> current_path_indices;        // Preallocate reasonable depth to prevent vector resizing mid-search
-        current_path_indices.reserve(1024); 
+        current_path_indices.reserve(1024);
 
         //DEBUG
         std::cout << "Initial State: " << std::endl;
@@ -185,14 +205,73 @@ extern "C" {
         }
         std::cout << std::endl;
 
-        
-        bool success = global_solver->solve_from_node(root_idx, current_path_indices);
+
+        bool success;
+        try {
+            success = global_solver->solve_from_node(root_idx, current_path_indices);
+        } catch (const std::bad_alloc&) {
+            // Same reasoning as CPORSolver::fallback_to_exhaustive_search's
+            // identical catch: the exhaustive search can combinatorially
+            // explode on some domains (a known, pre-existing FF/solve_from_node
+            // characteristic, out of scope to fix here); left uncaught here --
+            // this is solve_from_node's OTHER direct call site, invoked at the
+            // true root rather than via the fallback -- an allocation failure
+            // would cross the ctypes boundary as an unhandled exception and
+            // abort the whole host process. Report failure instead.
+            std::cerr << "[solve_native] CRITICAL: exhaustive search ran out of memory "
+                      << "(std::bad_alloc) -- reporting unsolvable instead of crashing." << std::endl;
+            success = false;
+        }
 
         if (success) {
             std::cout << ">>> SUCCESS: Contingent Plan Found! <<<" << std::endl;
             std::cout << "Total Universes Explored (Node Count): " << global_solver->get_node_count() << std::endl;
         }
         return success;
+    }
+
+    // Opt-in entry point for the new CPOR stack-based outer loop
+    // (CPORSolver::solve_cpor_loop), kept separate from solve_native() so the
+    // existing exhaustive-search path (and everything that calls it --
+    // problem_grounder.py, the rest of the test suite) is completely
+    // unaffected while this milestone's control-flow gets verified in
+    // isolation. Populates the identical node_pool/PlanNode extraction
+    // contract, so get_chosen_action/get_single_child/get_true_child/
+    // get_false_child/get_root_node_index/get_node_info all work unchanged
+    // against a tree built this way.
+    bool solve_native_cpor_loop() {
+        std::cout << "\n=== Starting Native CPOR Stack-Based Outer Loop ===" << std::endl;
+
+        if (global_solver) delete global_solver;
+        global_solver = new CPOR::CPORSolver();
+
+        PartiallySpecifiedState initial_state = build_owa_initial_state();
+
+        // FFSolver (used internally by SDRPlanner::compute_linear_plan, the
+        // OnlinePlan subroutine) and the fallback's compute_heuristic both
+        // benefit from/depend on this the same way solve_native() does.
+        bool ff_ready = CPOR::FFBridge::build(get_global_problem());
+        std::cout << "[FF] Relaxed-planning-graph heuristic "
+                  << (ff_ready ? "available for this problem." : "not usable for this problem (falling back to bounded BFS heuristic).")
+                  << std::endl;
+
+        int root_idx = global_solver->create_root_node(initial_state);
+        bool success = global_solver->solve_cpor_loop(root_idx);
+
+        if (success) {
+            std::cout << ">>> SUCCESS: Contingent Plan Found (CPOR loop)! <<<" << std::endl;
+            std::cout << "Total Universes Explored (Node Count): " << global_solver->get_node_count() << std::endl;
+        }
+        std::cout << "Layered fallback (Option 1) invocations this solve: " << global_solver->get_fallback_invocation_count() << std::endl;
+        return success;
+    }
+
+    // How many times the current global_solver's solve_cpor_loop() call had
+    // to invoke the layered fallback (Option 1) to solve_from_node. Only
+    // meaningful immediately after a solve_native_cpor_loop() call -- 0 means
+    // the online-planner loop resolved everything on its own.
+    int get_cpor_loop_fallback_count() {
+        return global_solver ? global_solver->get_fallback_invocation_count() : -1;
     }
     // =====================================================================
     // PLAN EXTRACTION GETTERS FOR PYTHON
@@ -305,7 +384,7 @@ extern "C" {
         }
 
         // 2. Call the newly architected static DOD solver
-        std::vector<int> plan = CPOR::BFSSolver::solve(initial_state, global_problem);
+        std::vector<int> plan = CPOR::BFSSolver::solve(initial_state, get_global_problem());
         
         // 3. Process the output
         if (plan.empty()) {

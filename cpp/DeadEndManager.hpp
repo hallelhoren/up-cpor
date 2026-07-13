@@ -5,8 +5,6 @@
 #include "ProblemData.hpp"
 #include "Evaluator.hpp"
 
-extern ProblemDef global_problem;
-
 namespace CPOR {
 
 enum class DeadEndStatus {
@@ -21,6 +19,15 @@ private:
     static inline std::unordered_set<PartiallySpecifiedState, StateHasher> dead_end_cache;
 
 public:
+    // dead_end_cache is keyed purely on bitmask content (PartiallySpecifiedState's
+    // operator==/StateHasher carry no problem identity), so a state cached as
+    // FATAL for one problem can collide with an equal-bitmask state from a
+    // later, unrelated problem loaded into the same process and be wrongly
+    // pruned. Must be called whenever a new problem is loaded.
+    static void reset_for_new_problem() {
+        dead_end_cache.clear();
+    }
+
     static DeadEndStatus check_dead_ends(const PartiallySpecifiedState& state) {
         // 1. O(1) Cache Lookup
         if (dead_end_cache.find(state) != dead_end_cache.end()) {
@@ -30,7 +37,7 @@ public:
         bool maybe_dead_end = false;
 
         // 2. Evaluate all known dead-end expressions
-        for (const auto& rpn : global_problem.deadend_rpns) {
+        for (const auto& rpn : get_global_problem().deadend_rpns) {
             uint8_t result = Evaluator::evaluate_rpn_raw(rpn, state);
             
             if (result == VAL_TRUE) {

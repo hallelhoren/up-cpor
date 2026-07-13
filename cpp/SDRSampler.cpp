@@ -8,6 +8,10 @@ namespace CPOR {
 // Thread-local storage ensures lock-free performance in a multi-threaded heuristic search
 thread_local Z3Manager g_z3_manager;
 
+void SDRSampler::reset_z3_state() {
+    g_z3_manager.invalidate();
+}
+
 std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
     const PartiallySpecifiedState& current_belief,
     const ProblemDef& global_problem,
@@ -24,9 +28,14 @@ std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
     const std::vector<z3::expr>& fluent_vars = g_z3_manager.fluent_vars;
 
     // 2. Scope the Solver State
-    // Pushes a new frame onto the solver stack. Everything added after this 
+    // Pushes a new frame onto the solver stack. Everything added after this
     // will be erased when pop() is called.
     solver.push();
+
+    // 2b. Assert only the oneof invariants still consistent with this specific belief
+    // state (see the doc comment on assert_relevant_oneofs for why this must be
+    // decided per-query rather than once permanently at depth 0).
+    g_z3_manager.assert_relevant_oneofs(current_belief, global_problem);
 
     // 3. Assert Known Epistemic Facts for THIS specific evaluation
     for (int i = 0; i < global_problem.total_predicates; ++i) {
@@ -74,8 +83,11 @@ std::vector<PartiallySpecifiedState> SDRSampler::sample_concrete_states(
     }
 
     // 5. Clean up the Solver Stack
-    // This instantly wipes the belief assertions and blocking clauses from Z3's memory,
-    // leaving the OneOf invariants completely intact at depth 0.
+    // This instantly wipes this query's belief assertions, blocking clauses, and
+    // the oneof invariants asserted in step 2b -- none of it should leak into the
+    // next query, which may be evaluating a completely different belief state
+    // (and, per assert_relevant_oneofs, a different subset of still-relevant
+    // oneof groups).
     solver.pop();
 
     return sampled_states;

@@ -142,6 +142,21 @@ int lnum_used_O;
 
 int lh;
 
+/* first_call guards and their associated lazily-sized state, for every
+ * relax.c function that allocates buffers on its first invocation. Kept at
+ * file scope (rather than function-local statics) so relax_reset_for_new_problem()
+ * can re-arm them when a new problem is loaded into this thread -- see the
+ * doc comment on relax_reset_for_new_problem() in relax.h. */
+static Bool s_collect_A_info_first_call = TRUE;
+static Bool s_build_fixpoint_first_call = TRUE;
+static Bool s_extract_1P_first_call = TRUE;
+static Bool s_initialize_goals_first_call = TRUE;
+static int s_initialize_goals_highest_seen = 0;
+static Bool s_collect_H_info_first_call = TRUE;
+static int *s_collect_H_info_H = NULL;
+static int s_collect_H_info_num_H = 0;
+static int *s_collect_H_info_D = NULL;
+
 
 
 
@@ -213,6 +228,60 @@ void initialize_relax( void )
 
   make_state( &lcurrent_goals, gnum_ft_conn );
   lcurrent_goals.max_F = gnum_ft_conn;
+
+}
+
+
+
+void relax_reset_for_new_problem( void )
+
+{
+
+  int i;
+
+  /* lcurrent_goals is (re)allocated by do_enforced_hill_climbing's own
+   * first_call block (search.c), which search_reset_for_new_problem() also
+   * re-arms whenever a new problem loads -- free the old buffer here first,
+   * since that block's make_state() call doesn't check for one. */
+  if ( lcurrent_goals.F ) { free( lcurrent_goals.F ); lcurrent_goals.F = NULL; lcurrent_goals.max_F = 0; lcurrent_goals.num_F = 0; }
+
+  if ( gA ) { free( gA ); gA = NULL; }
+  gnum_A = 0;
+
+  if ( lF ) { free( lF ); lF = NULL; }
+  if ( lE ) { free( lE ); lE = NULL; }
+  if ( lch_E ) { free( lch_E ); lch_E = NULL; }
+  if ( l0P_E ) { free( l0P_E ); l0P_E = NULL; }
+  lnum_F = lnum_E = lnum_ch_E = lnum_0P_E = 0;
+
+  if ( lgoals_at ) {
+    for ( i = 0; i < s_initialize_goals_highest_seen; i++ ) {
+      if ( lgoals_at[i] ) free( lgoals_at[i] );
+    }
+    free( lgoals_at );
+    lgoals_at = NULL;
+  }
+  if ( lnum_goals_at ) { free( lnum_goals_at ); lnum_goals_at = NULL; }
+  s_initialize_goals_highest_seen = 0;
+
+  if ( lch_F ) { free( lch_F ); lch_F = NULL; }
+  lnum_ch_F = 0;
+  if ( lused_O ) { free( lused_O ); lused_O = NULL; }
+  lnum_used_O = 0;
+  if ( gin_plan_E ) { free( gin_plan_E ); gin_plan_E = NULL; }
+  gnum_in_plan_E = 0;
+
+  if ( gH ) { free( gH ); gH = NULL; }
+  gnum_H = 0;
+  if ( s_collect_H_info_H ) { free( s_collect_H_info_H ); s_collect_H_info_H = NULL; }
+  s_collect_H_info_num_H = 0;
+  if ( s_collect_H_info_D ) { free( s_collect_H_info_D ); s_collect_H_info_D = NULL; }
+
+  s_collect_A_info_first_call = TRUE;
+  s_build_fixpoint_first_call = TRUE;
+  s_extract_1P_first_call = TRUE;
+  s_initialize_goals_first_call = TRUE;
+  s_collect_H_info_first_call = TRUE;
 
 }
 
@@ -298,14 +367,12 @@ void collect_A_info( void )
 
 {
 
-  static Bool first_call = TRUE;
-
   int i;
 
-  if ( first_call ) {
+  if ( s_collect_A_info_first_call ) {
     gA = ( int * ) calloc( gnum_op_conn, sizeof( int ) );
     gnum_A = 0;
-    first_call = FALSE;
+    s_collect_A_info_first_call = FALSE;
   }
 
   for ( i = 0; i < gnum_A; i++ ) {
@@ -362,31 +429,29 @@ int build_fixpoint( State *S )
 
   int start_ft, stop_ft, start_ef, stop_ef, i, time = 0;
 
-  static Bool first_call = TRUE;
-
-  if ( first_call ) {
+  if ( s_build_fixpoint_first_call ) {
     /* get memory for local globals
      */
     lF = ( int * ) calloc( gnum_ft_conn, sizeof( int ) );
     lE = ( int * ) calloc( gnum_ef_conn, sizeof( int ) );
     lch_E = ( int * ) calloc( gnum_ef_conn, sizeof( int ) );
     l0P_E = ( int * ) calloc( gnum_ef_conn, sizeof( int ) );
-    
+
     /* initialize connectivity graph members for
      * relaxed planning
      */
     lnum_0P_E = 0;
-    for ( i = 0; i < gnum_ef_conn; i++ ) {      
-      gef_conn[i].level = INFINITY;    
+    for ( i = 0; i < gnum_ef_conn; i++ ) {
+      gef_conn[i].level = INFINITY;
       gef_conn[i].in_E = FALSE;
       gef_conn[i].num_active_PCs = 0;
       gef_conn[i].ch = FALSE;
-      
+
       if ( gef_conn[i].num_PC == 0 ) {
 	l0P_E[lnum_0P_E++] = i;
       }
     }
-    for ( i = 0; i < gnum_op_conn; i++ ) {      
+    for ( i = 0; i < gnum_op_conn; i++ ) {
       gop_conn[i].is_in_A = FALSE;
       gop_conn[i].is_in_H = FALSE;
     }
@@ -394,7 +459,7 @@ int build_fixpoint( State *S )
       gft_conn[i].level = INFINITY;
       gft_conn[i].in_F = FALSE;
     }
-    first_call = FALSE;
+    s_build_fixpoint_first_call = FALSE;
   }
 
   initialize_fixpoint( S );
@@ -663,10 +728,9 @@ int extract_1P( int max, Bool H_info )
 
 {
 
-  static Bool first_call = TRUE;
   int i, max_goal_level, time;
 
-  if ( first_call ) {
+  if ( s_extract_1P_first_call ) {
     for ( i = 0; i < gnum_ft_conn; i++ ) {
       gft_conn[i].is_true = INFINITY;
       gft_conn[i].is_goal = FALSE;
@@ -684,7 +748,7 @@ int extract_1P( int max, Bool H_info )
     lnum_used_O = 0;
     gin_plan_E = ( int * ) calloc( gnum_ef_conn, sizeof( int ) );
     gnum_in_plan_E = 0;
-    first_call = FALSE;
+    s_extract_1P_first_call = FALSE;
   }
 
   reset_search_info();
@@ -711,31 +775,28 @@ int initialize_goals( int max )
 
 {
 
-  static Bool first_call = TRUE;
-  static int highest_seen;
-
   int i, max_goal_level, ft;
 
-  if ( first_call ) {
+  if ( s_initialize_goals_first_call ) {
     lgoals_at = ( int ** ) calloc( RELAXED_STEPS_DEFAULT, sizeof( int * ) );
     lnum_goals_at = ( int * ) calloc( RELAXED_STEPS_DEFAULT, sizeof( int ) );
     for ( i = 0; i < RELAXED_STEPS_DEFAULT; i++ ) {
       lgoals_at[i] = ( int * ) calloc( gnum_ft_conn, sizeof( int ) );
     }
-    highest_seen = RELAXED_STEPS_DEFAULT;
-    first_call = FALSE;
+    s_initialize_goals_highest_seen = RELAXED_STEPS_DEFAULT;
+    s_initialize_goals_first_call = FALSE;
   }
 
-  if ( max + 1 > highest_seen ) {
-    for ( i = 0; i < highest_seen; i++ ) {
+  if ( max + 1 > s_initialize_goals_highest_seen ) {
+    for ( i = 0; i < s_initialize_goals_highest_seen; i++ ) {
       free( lgoals_at[i] );
     }
     free( lgoals_at );
     free( lnum_goals_at );
-    highest_seen = max + 1;
-    lgoals_at = ( int ** ) calloc( highest_seen, sizeof( int * ) );
-    lnum_goals_at = ( int * ) calloc( highest_seen, sizeof( int ) );
-    for ( i = 0; i < highest_seen; i++ ) {
+    s_initialize_goals_highest_seen = max + 1;
+    lgoals_at = ( int ** ) calloc( s_initialize_goals_highest_seen, sizeof( int * ) );
+    lnum_goals_at = ( int * ) calloc( s_initialize_goals_highest_seen, sizeof( int ) );
+    for ( i = 0; i < s_initialize_goals_highest_seen; i++ ) {
       lgoals_at[i] = ( int * ) calloc( gnum_ft_conn, sizeof( int ) );
     }
   }
@@ -877,24 +938,22 @@ void collect_H_info( void )
 
 {
 
-  static Bool first_call = TRUE;
-  static int *H, num_H, *D;
   int i, j, k, ft, ef, op, d;
 
-  if ( first_call ) {
+  if ( s_collect_H_info_first_call ) {
     gH = ( int * ) calloc( gnum_op_conn, sizeof( int ) );
-    H = ( int * ) calloc( gnum_op_conn, sizeof( int ) );
-    D = ( int * ) calloc( gnum_op_conn, sizeof( int ) );
+    s_collect_H_info_H = ( int * ) calloc( gnum_op_conn, sizeof( int ) );
+    s_collect_H_info_D = ( int * ) calloc( gnum_op_conn, sizeof( int ) );
     gnum_H = 0;
-    num_H = 0;
-    first_call = FALSE;
+    s_collect_H_info_num_H = 0;
+    s_collect_H_info_first_call = FALSE;
   }
 
   for ( i = 0; i < gnum_H; i++ ) {
     gop_conn[gH[i]].is_in_H = FALSE;
   }
 
-  num_H = 0;
+  s_collect_H_info_num_H = 0;
   for ( i = 0; i < lnum_goals_at[1]; i++ ) {
     ft = lgoals_at[1][i];
 
@@ -909,7 +968,7 @@ void collect_H_info( void )
 	continue;
       }
       gop_conn[op].is_in_H = TRUE;
-      H[num_H++] = op;
+      s_collect_H_info_H[s_collect_H_info_num_H++] = op;
     }
   }
 
@@ -921,24 +980,24 @@ void collect_H_info( void )
    *       goals to upper goals.
    */
   gnum_H = 0;
-  for ( i = num_H - 1; i > -1; i-- ) {
+  for ( i = s_collect_H_info_num_H - 1; i > -1; i-- ) {
     d = 0;
-    for ( j = 0; j < gop_conn[H[i]].num_E; j++ ) {
-      ef = gop_conn[H[i]].E[j];
+    for ( j = 0; j < gop_conn[s_collect_H_info_H[i]].num_E; j++ ) {
+      ef = gop_conn[s_collect_H_info_H[i]].E[j];
       if ( gef_conn[ef].level != 0 ) continue;
       for ( k = 0; k < gef_conn[ef].num_D; k++ ) {
 	if ( gft_conn[gef_conn[ef].D[k]].is_goal ) d++;
       }
     }
     for ( j = 0; j < gnum_H; j++ ) {
-      if ( D[j] > d ) break;
+      if ( s_collect_H_info_D[j] > d ) break;
     }
     for ( k = gnum_H; k > j; k-- ) {
       gH[k] = gH[k-1];
-      D[k] = D[k-1];
+      s_collect_H_info_D[k] = s_collect_H_info_D[k-1];
     }
-    gH[j] = H[i];
-    D[j] = d;
+    gH[j] = s_collect_H_info_H[i];
+    s_collect_H_info_D[j] = d;
     gnum_H++;
   }
   if ( gcmd_line.display_info == 124 ) {

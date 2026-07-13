@@ -216,12 +216,15 @@ bool SDRPlanner::apply_observation(bool observation_value) {
 
 
 std::vector<int> SDRPlanner::compute_linear_plan(
-    const BeliefState& current_belief, 
-    const ProblemDef& problem, 
-    int sample_size) 
+    const BeliefState& current_belief,
+    const ProblemDef& problem,
+    int sample_size,
+    int* out_blocking_action_id)
 {
+    if (out_blocking_action_id) *out_blocking_action_id = -1;
+
     // 1. Determinization: Sample diverse concrete "witness" states
-    std::vector<PartiallySpecifiedState> sampled_states = 
+    std::vector<PartiallySpecifiedState> sampled_states =
         SDRSampler::sample_concrete_states(current_belief.get_current_state(), problem, sample_size);
 
     if (sampled_states.empty()) {
@@ -233,7 +236,7 @@ std::vector<int> SDRPlanner::compute_linear_plan(
 
     // 3. Route to the Classical Forward Search (Native FF C-API Wrapper)
     std::vector<int> candidate_plan = FFSolver::search(primary_guide_state, problem);
-    
+
     if (candidate_plan.empty()) {
         return {}; // No classical path found
     }
@@ -257,6 +260,7 @@ std::vector<int> SDRPlanner::compute_linear_plan(
         }
 
         if (is_unsafe) {
+            if (out_blocking_action_id) *out_blocking_action_id = action_id;
             break; // Truncate BEFORE adding the unsafe action
         }
 
@@ -275,6 +279,7 @@ std::vector<int> SDRPlanner::compute_linear_plan(
         }
 
         if (is_unsafe) {
+            if (out_blocking_action_id) *out_blocking_action_id = action_id;
             break; // Action was valid to start, but led to a dead-end. Truncate BEFORE adding.
         }
 
@@ -297,7 +302,7 @@ std::vector<int> SDRPlanner::compute_linear_plan(
         if (causes_divergence) {
             // We KEEP the sensing action (already pushed to robust_plan) because it is safe.
             // But we break here so CPOR can gracefully split the tree based on the divergent truths.
-            break; 
+            break;
         }
     }
 

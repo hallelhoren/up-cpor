@@ -72,6 +72,14 @@ Bool LESS( int a, int b );
 
 
 void initialize_relax( void );
+/* Discards every buffer relax.c's functions allocate lazily on their first
+ * ever call (gA, lF/lE/lch_E/l0P_E, lgoals_at/lnum_goals_at, lch_F/lused_O,
+ * gin_plan_E, gH/H/D) and re-arms their first_call guards. Those buffers are
+ * sized once from whatever problem happened to trigger the first call in a
+ * given thread and are never otherwise resized; reused as-is for a
+ * differently-sized problem loaded later in the same thread, they overflow.
+ * Must be called by ff_load_problem() before any subsequent search. */
+void relax_reset_for_new_problem( void );
 int get_1P_and_H( State *S, State *current_goals );
 int get_1P( State *S, State *current_goals );
 void get_A( State *S );

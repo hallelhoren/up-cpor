@@ -1,42 +1,19 @@
 #include "FFSolver.hpp"
-#include <iostream>
-#include <cstdlib>
-
+#include "FFBridge.hpp"
 
 namespace CPOR {
 
+// Thin pass-through to FFBridge, which owns the negation ("not-P" shadow
+// fact) bookkeeping needed to correctly build the determinized-state bitset
+// FF's ff_search() expects. FFBridge::build(problem) must already have been
+// called for `global_problem` (native_bridge.cpp's solve_native() does this
+// once per problem load, before any search begins) -- if it wasn't, or the
+// problem wasn't fully representable in FF's STRIPS model, this returns
+// empty and the caller should fall back to a sound alternative.
 std::vector<int> FFSolver::search(const PartiallySpecifiedState& concrete_state, const ProblemDef& global_problem) {
-    ff_reset_search_state();
-    ff_clear_hash_table();
-
-    std::vector<int> true_facts;
-    true_facts.reserve(global_problem.total_predicates);
-
-    for (int i = 0; i < global_problem.total_predicates; ++i) {
-        if (concrete_state.is_true(i)) {
-            true_facts.push_back(i);
-        }
-    }
-
-    int plan_length = 0;
-    
-    // Note: Added static_cast<int> to avoid compiler warnings since size() returns size_t
-    int* raw_c_plan = ff_search(true_facts.data(), static_cast<int>(true_facts.size()), &plan_length);
-
-    if (raw_c_plan == nullptr || plan_length < 0) {
-        return {}; 
-    }
-
-    std::vector<int> candidate_plan;
-    candidate_plan.reserve(static_cast<size_t>(plan_length));
-    
-    for (int i = 0; i < plan_length; ++i) {
-        candidate_plan.push_back(raw_c_plan[i]);
-    }
-
-    std::free(raw_c_plan);
-
-    return candidate_plan;
+    (void)global_problem;
+    if (!FFBridge::is_available()) return {};
+    return FFBridge::search(concrete_state);
 }
 
 } // namespace CPOR

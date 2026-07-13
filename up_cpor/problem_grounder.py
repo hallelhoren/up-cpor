@@ -21,11 +21,14 @@ class StaticEvaluator(up.model.walkers.dag.DagWalker):
     """
     Standard DagWalker implementation to replace static fluents with constants.
     """
-    def __init__(self, env, static_fluents: Set[Fluent], initial_values: Dict[FNode, FNode]):
-        super().__init__() 
+    def __init__(self, env, static_fluents: Set[Fluent], initial_values: Dict[FNode, FNode], problem):
+        super().__init__()
+        self.env = env
         self.static_fluents = static_fluents
         self.initial_values = initial_values
+        self.problem = problem
         self.em = env.expression_manager
+        self.substituter = Substituter(env)
 
     def walk_fluent_exp(self, expression: FNode, args: List[FNode], **kwargs) -> FNode:
         if expression.fluent() in self.static_fluents:
@@ -47,6 +50,43 @@ class StaticEvaluator(up.model.walkers.dag.DagWalker):
     def walk_real_constant(self, expression, args, **kwargs): return expression
     def walk_bool_constant(self, expression, args, **kwargs): return expression
     def walk_object_exp(self, expression, args, **kwargs): return expression
+
+    # Bound quantifier variables pass through untouched here -- they only get
+    # resolved by walk_forall/walk_exists below, which substitute them with
+    # concrete objects *before* re-walking the body (static-fluent lookups
+    # require fully grounded fluent expressions, so substitution must happen
+    # before, not after, the static-fluent collapse in walk_fluent_exp).
+    def walk_variable_exp(self, expression, args, **kwargs): return expression
+
+    def walk_forall(self, expression: FNode, args: List[FNode], **kwargs) -> FNode:
+        return self._expand_quantifier(expression, self.em.And, self.em.TRUE)
+
+    def walk_exists(self, expression: FNode, args: List[FNode], **kwargs) -> FNode:
+        return self._expand_quantifier(expression, self.em.Or, self.em.FALSE)
+
+    def _expand_quantifier(self, expression: FNode, combine, vacuous_value) -> FNode:
+        # DagWalker already (uselessly) walked the raw body with the bound
+        # variable(s) still abstract to compute `args`; that result is
+        # discarded here in favor of grounding over each variable's object
+        # domain first, then re-walking each concrete instance so static
+        # fluents resolve correctly.
+        body = expression.arg(0)
+        variables = list(expression.variables())
+        domains = [list(self.problem.objects(var.type)) for var in variables]
+
+        instances = []
+        for combo in itertools.product(*domains):
+            substitutions = dict(zip(variables, combo))
+            grounded_body = self.substituter.substitute(body, substitutions)
+            # Re-walked with a fresh evaluator instance: DagWalker's traversal
+            # stack is instance state, so reusing `self` reentrantly here
+            # would corrupt the in-progress outer walk.
+            sub_evaluator = StaticEvaluator(self.env, self.static_fluents, self.initial_values, self.problem)
+            instances.append(sub_evaluator.walk(grounded_body))
+
+        if not instances:
+            return vacuous_value()
+        return combine(instances)
 
 
 class UpCporConverter:
@@ -70,14 +110,38 @@ class UpCporConverter:
         substituter = Substituter(original_problem.environment)
         simplifier = original_problem.environment.simplifier
 
-        # 1. Identify dynamic and static fluents
+        # 1. Identify dynamic and static fluents.
+        # A fluent must stay a tracked (dynamic) predicate in the C++ engine if its
+        # epistemic status matters at runtime: it's assigned by an effect, sensed by
+        # a sensing action, or genuinely uncertain in the initial belief (referenced by
+        # a oneof/or/hidden-fluent constraint). Domains like doors/wumpus commonly sense
+        # a fact that no action ever assigns (e.g. whether a door is open) -- collapsing
+        # such a fluent to a compile-time constant would silently erase its uncertainty
+        # and degrade the contingent problem into a fully-observable one.
+        def _base_fluent(fnode):
+            return fnode.arg(0).fluent() if fnode.is_not() else fnode.fluent()
+
         dynamic_fluents = set()
         for action in original_problem.actions:
             for eff in action.effects:
                 dynamic_fluents.add(eff.fluent.fluent())
-        
+            if hasattr(action, 'observed_fluents'):
+                for obs in action.observed_fluents:
+                    dynamic_fluents.add(_base_fluent(obs))
+
+        for group in getattr(original_problem, 'oneof_constraints', []):
+            for f in group:
+                dynamic_fluents.add(_base_fluent(f))
+
+        for group in getattr(original_problem, 'or_constraints', []):
+            for f in group:
+                dynamic_fluents.add(_base_fluent(f))
+
+        for f in getattr(original_problem, 'hidden_fluents', ()):
+            dynamic_fluents.add(_base_fluent(f))
+
         static_fluents = set(f for f in original_problem.fluents if f not in dynamic_fluents)
-        static_evaluator = StaticEvaluator(original_problem.environment, static_fluents, original_problem.initial_values)
+        static_evaluator = StaticEvaluator(original_problem.environment, static_fluents, original_problem.initial_values, original_problem)
 
         # 2. Build fluent dictionary ONLY for dynamic fluents
         self._build_fluent_dict(original_problem, em, dynamic_fluents)
@@ -174,16 +238,24 @@ class UpCporConverter:
                         reachable_actions.append((action, subs, simplified_preconditions))
                         reachable_action_signatures.add(signature)
                         
-                        for eff in action.effects:
-                            cond_grounded = substituter.substitute(eff.condition, subs)
-                            static_evaluated_cond = static_evaluator.walk(cond_grounded)
-                            simplified_cond = simplifier.simplify(static_evaluated_cond)
-                            
-                            if eff.value.is_true() and simplified_cond.is_true():
-                                fluent_str = str(substituter.substitute(eff.fluent, subs))
-                                if fluent_str not in reachable_facts:
-                                    reachable_facts.add(fluent_str)
-                                    facts_changed = True
+                        # expand_effect() is a no-op iterator-of-one for a plain effect, and
+                        # substitutes each forall variable in fluent/value/condition with a
+                        # concrete object for a quantified one (e.g. navigate-to's `(forall
+                        # (?x - object) (when (not (= ?x ?o)) (not (reachable ?x))))`).
+                        # Skipping this left `eff.fluent` symbolically bound to the unexpanded
+                        # forall variable, which never matches any real grounded fact string --
+                        # the effect was silently dropped instead of applied per-object.
+                        for base_eff in action.effects:
+                            for eff in base_eff.expand_effect(original_problem):
+                                cond_grounded = substituter.substitute(eff.condition, subs)
+                                static_evaluated_cond = static_evaluator.walk(cond_grounded)
+                                simplified_cond = simplifier.simplify(static_evaluated_cond)
+
+                                if eff.value.is_true() and simplified_cond.is_true():
+                                    fluent_str = str(substituter.substitute(eff.fluent, subs))
+                                    if fluent_str not in reachable_facts:
+                                        reachable_facts.add(fluent_str)
+                                        facts_changed = True
                                     
                         if hasattr(action, 'observed_fluents') and action.observed_fluents:
                             obs_str = str(substituter.substitute(action.observed_fluents[0], subs))
@@ -196,7 +268,7 @@ class UpCporConverter:
         for action, subs, simplified_preconditions in reachable_actions:
             actual_params = tuple(subs[p] for p in action.parameters)
             self.action_id_to_up_action[action_idx] = ActionInstance(action, actual_params)
-            
+
             pre_rpn = []
             for i, p in enumerate(simplified_preconditions):
                 pre_rpn.extend(self._compile_to_rpn(p))
@@ -220,27 +292,32 @@ class UpCporConverter:
 
             conditional_map = {}
 
-            for eff in action.effects:
-                fluent_str = str(substituter.substitute(eff.fluent, subs))
-                if fluent_str not in self.fluent_to_id:
-                    continue
-                
-                fluent_id = self.fluent_to_id[fluent_str]
-                val = eff.value.is_true() if eff.value.is_bool_constant() else False
-                
-                cond_grounded = substituter.substitute(eff.condition, subs)
-                static_evaluated_cond = static_evaluator.walk(cond_grounded)
-                simplified_cond = simplifier.simplify(static_evaluated_cond)
-                
-                if simplified_cond.is_true():
-                    act_dict['eff_facts'].append(fluent_id)
-                    act_dict['eff_vals'].append(val)
-                elif not simplified_cond.is_false():
-                    cond_rpn = tuple(self._compile_to_rpn(simplified_cond))
-                    if cond_rpn not in conditional_map:
-                        conditional_map[cond_rpn] = {'eff_facts': [], 'eff_vals': []}
-                    conditional_map[cond_rpn]['eff_facts'].append(fluent_id)
-                    conditional_map[cond_rpn]['eff_vals'].append(val)
+            # See the matching comment in the reachability-filter pass above: forall-effects
+            # (e.g. navigate-to's "make every other object unreachable") must be expanded to
+            # one concrete effect per quantified object before the fluent-string lookup, or
+            # they're silently dropped -- their fluent never matches a real grounded fact.
+            for base_eff in action.effects:
+                for eff in base_eff.expand_effect(original_problem):
+                    fluent_str = str(substituter.substitute(eff.fluent, subs))
+                    if fluent_str not in self.fluent_to_id:
+                        continue
+
+                    fluent_id = self.fluent_to_id[fluent_str]
+                    val = eff.value.is_true() if eff.value.is_bool_constant() else False
+
+                    cond_grounded = substituter.substitute(eff.condition, subs)
+                    static_evaluated_cond = static_evaluator.walk(cond_grounded)
+                    simplified_cond = simplifier.simplify(static_evaluated_cond)
+
+                    if simplified_cond.is_true():
+                        act_dict['eff_facts'].append(fluent_id)
+                        act_dict['eff_vals'].append(val)
+                    elif not simplified_cond.is_false():
+                        cond_rpn = tuple(self._compile_to_rpn(simplified_cond))
+                        if cond_rpn not in conditional_map:
+                            conditional_map[cond_rpn] = {'eff_facts': [], 'eff_vals': []}
+                        conditional_map[cond_rpn]['eff_facts'].append(fluent_id)
+                        conditional_map[cond_rpn]['eff_vals'].append(val)
 
             for k, v in conditional_map.items():
                 act_dict['conditional_effects'].append({
@@ -302,7 +379,7 @@ class UpCporConverter:
             # In an open world scenario, negations are considered logically satisfiable
             # unless mathematically collapsed to False earlier by the simplifier process.
             return True
-            
+
         return True
 
     def _build_fluent_dict(self, problem: up.model.Problem, em, dynamic_fluents: set):
@@ -366,22 +443,33 @@ class UpCporConverter:
             rpn.append(OP_EQUALS)
             return rpn
 
+        num_args = len(node.args)
+
+        if node.node_type in (OperatorKind.AND, OperatorKind.OR, OperatorKind.EQUALS):
+            # Left-fold: emit each operand immediately followed by its combining
+            # operator, rather than pushing all N operands before any operator.
+            # The evaluator's stack-based interpreter has O(1) space for a
+            # left-folded chain, but the naive "push everything, then combine"
+            # encoding needs O(N) evaluation-time stack depth -- unsound for
+            # wide N-ary formulas (e.g. a `forall` expanded over many objects),
+            # where N can exceed the evaluator's fixed stack capacity.
+            op_token = {
+                OperatorKind.AND: OP_AND,
+                OperatorKind.OR: OP_OR,
+                OperatorKind.EQUALS: OP_EQUALS,
+            }[node.node_type]
+
+            rpn = self._compile_to_rpn(node.args[0])
+            for arg in node.args[1:]:
+                rpn.extend(self._compile_to_rpn(arg))
+                rpn.append(op_token)
+            return rpn
+
         rpn = []
         for arg in node.args:
             rpn.extend(self._compile_to_rpn(arg))
 
-        num_args = len(node.args)
-        
-        if node.node_type == OperatorKind.AND:
-            if num_args > 1:
-                rpn.extend([OP_AND] * (num_args - 1))
-        elif node.node_type == OperatorKind.OR:
-            if num_args > 1:
-                rpn.extend([OP_OR] * (num_args - 1))
-        elif node.node_type == OperatorKind.EQUALS:
-            if num_args > 1:
-                rpn.extend([OP_EQUALS] * (num_args - 1))
-        elif node.node_type == OperatorKind.NOT:
+        if node.node_type == OperatorKind.NOT:
             if num_args == 1:
                 rpn.append(OP_NOT)
             else:
@@ -392,7 +480,19 @@ class UpCporConverter:
         return rpn
 
 
-def run_my_grounder_and_solve(problem):
+def run_my_grounder_and_solve(problem, use_cpor_loop: bool = True):
+    """Grounds `problem` and solves it natively.
+
+    use_cpor_loop selects which C++ entry point builds the plan tree:
+    True (default) routes to CPORSolver::solve_cpor_loop, the stack-based
+    CPOR outer loop -- solve_from_node (the legacy exhaustive AND/OR search)
+    remains available underneath it as a layered fallback (Option 1) for any
+    subtree the online planner can't resolve on its own. False routes
+    directly to the legacy solve_native()/solve_from_node path, kept for
+    comparison/debugging and as an escape hatch. Both populate the identical
+    node_pool extraction contract below, so nothing past this point needs to
+    know which one ran.
+    """
     from unified_planning.plans.contingent_plan import ContingentPlanNode
     from unified_planning.model.walkers import Substituter
 
@@ -400,8 +500,14 @@ def run_my_grounder_and_solve(problem):
     converter = UpCporConverter()
     converter.generate_native_problem(problem)
 
-    print("[Native API] Invoking YOUR solve_native()...")
-    success = native_api.solve_native()
+    if use_cpor_loop:
+        print("[Native API] Invoking solve_native_cpor_loop()...")
+        success = native_api.solve_native_cpor_loop()
+        fallback_count = native_api.get_cpor_loop_fallback_count()
+        print(f"[Native API] Layered fallback (Option 1) invocations this solve: {fallback_count}")
+    else:
+        print("[Native API] Invoking solve_native()...")
+        success = native_api.solve_native()
 
     if not success:
         print("[Native API] CPORSolver returned NO SOLUTION.")

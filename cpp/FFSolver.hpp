@@ -1,14 +1,18 @@
 #pragma once
+#include <cstdint>
 #include <vector>
 #include "State.hpp"
 #include "ProblemData.hpp"
 
-// הצהרה על פונקציות ה-C מספריית FF (מניח שקיימות ב-ff_api.h)
+// Real signatures, matching FF-v2.3/ff_api.h exactly. (A prior version of this
+// file declared a different, incompatible ff_search signature -- int*/int/int*
+// instead of the real const uint64_t*/int* -- which the linker happily bound
+// anyway since C has no signature-based overload resolution, silently
+// corrupting every call across the C-ABI boundary.)
 extern "C" {
     void ff_reset_search_state();
     void ff_clear_hash_table();
-    // החתימה המעודכנת: מקבלת מערך עובדות אמת, את מספרן, ופוינטר לאורך התוכנית
-    int* ff_search(int* true_facts, int num_true_facts, int* out_plan_length);
+    int* ff_search(const uint64_t* determinized_state_bitset, int* out_plan_length);
 }
 
 namespace CPOR {

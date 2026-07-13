@@ -24,6 +24,17 @@ public:
         const ProblemDef& global_problem,
         int target_sample_count
     );
+
+    /**
+     * @brief Invalidates this thread's Z3 state (fluent variables and the
+     * permanently-asserted dead-end constraints; oneof constraints are asserted
+     * per-query -- see Z3Manager::assert_relevant_oneofs). Must be called whenever
+     * a new problem is loaded, before any sample_concrete_states() call for
+     * that problem -- otherwise a thread that solves more than one problem
+     * (e.g. sequential pytest cases without process isolation) silently
+     * reuses the first problem's stale Z3 state for every subsequent one.
+     */
+    static void reset_z3_state();
 };
 
 } // namespace CPOR

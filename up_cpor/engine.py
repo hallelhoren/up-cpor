@@ -19,12 +19,17 @@ CPORCredits = None
 
 class CPORImpl(Engine, OneshotPlannerMixin):
 
-    def __init__(self, bOnline = False, random_seed: Optional[int] = None, **options):
+    def __init__(self, bOnline = False, random_seed: Optional[int] = None, use_cpor_loop: bool = True, **options):
         up.engines.Engine.__init__(self)
         up.engines.mixins.OneshotPlannerMixin.__init__(self)
         self.bOnline = bOnline
         self._skip_checks = False
         self.random_seed = _coerce_random_seed(random_seed)
+        # Selects solve_native_cpor_loop() (the stack-based CPOR outer loop,
+        # with the legacy exhaustive search as its own internal layered
+        # fallback) vs. the legacy solve_native() path directly -- see
+        # up_cpor.problem_grounder.run_my_grounder_and_solve's doc comment.
+        self.use_cpor_loop = use_cpor_loop
 
     @property
     def name(self) -> str:
@@ -65,25 +70,21 @@ class CPORImpl(Engine, OneshotPlannerMixin):
                ) -> 'PlanGenerationResult':
         
         assert isinstance(problem, ContingentProblem)
-        
+
         # =====================================================================
         # Orchestration only.
         # Grounding SSoT: up_cpor.problem_grounder.extract_grounded_problem_data.
         # Native interop SSoT: up_cpor.native_api.
         # =====================================================================
-        problem_name = getattr(problem, 'name', '').lower()
-        if "blocks" in problem_name or "bw-rand" in problem_name:
-            from up_cpor.problem_grounder import run_my_grounder_and_solve 
-            from unified_planning.plans import ContingentPlan
-            
-            root_node = run_my_grounder_and_solve(problem)
-            
-            if not root_node:
-                return PlanGenerationResult(PlanGenerationResultStatus.UNSOLVABLE_PROVEN, None, self.name)
-            
-            return PlanGenerationResult(PlanGenerationResultStatus.SOLVED_SATISFICING, ContingentPlan(root_node), self.name)
-        
-        raise NotImplementedError("Non-blocks problems require the legacy C# engine, which has been removed.")
+        from up_cpor.problem_grounder import run_my_grounder_and_solve
+        from unified_planning.plans import ContingentPlan
+
+        root_node = run_my_grounder_and_solve(problem, use_cpor_loop=self.use_cpor_loop)
+
+        if not root_node:
+            return PlanGenerationResult(PlanGenerationResultStatus.UNSOLVABLE_PROVEN, None, self.name)
+
+        return PlanGenerationResult(PlanGenerationResultStatus.SOLVED_SATISFICING, ContingentPlan(root_node), self.name)
 
     def destroy(self):
         pass

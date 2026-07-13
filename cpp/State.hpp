@@ -7,8 +7,6 @@
 #include <cmath>
 #include "ProblemData.hpp"
 
-extern ProblemDef global_problem;
-
 /**
  * @class PartiallySpecifiedState
  * @brief Represents a single possible world using Dual-Mask bitsets.
@@ -99,13 +97,14 @@ public:
 
     // Equality operator masking out ignored variables dynamically
     bool operator==(const PartiallySpecifiedState& other) const {
+        const std::vector<uint64_t>& comparable_mask = get_global_problem().comparable_mask;
         for (size_t i = 0; i < known_mask.size(); ++i) {
-            uint64_t k1 = known_mask[i] & global_problem.comparable_mask[i];
-            uint64_t k2 = other.known_mask[i] & global_problem.comparable_mask[i];
+            uint64_t k1 = known_mask[i] & comparable_mask[i];
+            uint64_t k2 = other.known_mask[i] & comparable_mask[i];
             if (k1 != k2) return false;
 
-            uint64_t v1 = value_mask[i] & global_problem.comparable_mask[i];
-            uint64_t v2 = other.value_mask[i] & global_problem.comparable_mask[i];
+            uint64_t v1 = value_mask[i] & comparable_mask[i];
+            uint64_t v2 = other.value_mask[i] & comparable_mask[i];
             if (v1 != v2) return false;
         }
 
@@ -213,8 +212,9 @@ struct StateHasher {
         std::size_t seed = 0;
 
         // Hash the Boolean Fluents
+        const std::vector<uint64_t>& comparable_mask = get_global_problem().comparable_mask;
         for (size_t i = 0; i < s.known_mask.size(); ++i) {
-            uint64_t k_block = s.known_mask[i] & global_problem.comparable_mask[i];
+            uint64_t k_block = s.known_mask[i] & comparable_mask[i];
             
             // Mask the value_block with the known_block BEFORE hashing.
             // This is a foolproof secondary safety net. Even if a garbage bit 

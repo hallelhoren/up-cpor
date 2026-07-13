@@ -117,4 +117,14 @@ void print_state( State S );
 
 extern void ff_clear_hash_table();
 
+/* Discards every State/buffer that do_enforced_hill_climbing,
+ * search_for_better_state, expand_first_node, do_best_first_search, and
+ * result_to_dest allocate lazily on their first-ever call, and re-arms their
+ * first_call guards. Those buffers are sized once from whatever problem
+ * happened to trigger the first call in a given thread and are never
+ * otherwise resized; reused as-is for a differently-sized problem loaded
+ * later in the same thread, they overflow. Must be called by
+ * ff_load_problem() before any subsequent search. */
+void search_reset_for_new_problem( void );
+
 #endif /* _SEARCH_H */

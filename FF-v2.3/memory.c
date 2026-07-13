@@ -637,7 +637,14 @@ EhcNode *new_EhcNode( void )
 
   result->new_goal = -1;
 
-  result->S.max_F = 0;
+  /* result->S.F must be allocated here, not left NULL: callers
+   * (add_to_ehc_space, search_for_better_state) write into it via
+   * copy_source_to_dest()/source_to_dest(), which do dest->F[i] =
+   * source->F[i] with no NULL check. gnum_ft_conn is set once by
+   * ff_load_problem() before any search begins, so it's always valid by the
+   * time a search is running (the only context new_EhcNode() is called in). */
+  make_state( &result->S, gnum_ft_conn > 0 ? gnum_ft_conn : 1 );
+  result->S.max_F = gnum_ft_conn;
 
   return result;
 
@@ -692,7 +699,9 @@ BfsNode *new_BfsNode( void )
   result->next = NULL;
   result->prev = NULL;
 
-  result->S.max_F = 0;
+  /* Same reasoning as new_EhcNode(): S.F must be allocated up front. */
+  make_state( &result->S, gnum_ft_conn > 0 ? gnum_ft_conn : 1 );
+  result->S.max_F = gnum_ft_conn;
 
   return result;
 

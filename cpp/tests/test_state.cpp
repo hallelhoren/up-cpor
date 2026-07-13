@@ -2,14 +2,13 @@
 #include <cassert>
 #include "../State.hpp"
 
-ProblemDef global_problem;
-
 void init_mock_problem(int total_predicates) {
-    global_problem.total_predicates = total_predicates;
-    
+    reset_global_problem();
+    get_global_problem().total_predicates = total_predicates;
+
     int blocks = (total_predicates / 64) + 1;
     // CRITICAL FIX: Ensure the comparable_mask exists so StateHasher doesn't segfault
-    global_problem.comparable_mask.assign(blocks, ~0ULL); 
+    get_global_problem().comparable_mask.assign(blocks, ~0ULL);
 }
 
 void run_state_tests() {

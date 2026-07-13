@@ -5,9 +5,6 @@
 #include "../State.hpp"
 #include "../Evaluator.hpp"
 
-// Explicitly link to the global problem memory stored in native_bridge.cpp
-extern ProblemDef global_problem;
-
 // Expose the C-API bridge functions so we can simulate Python's behavior
 extern "C" {
     void init_problem(int total_predicates);
@@ -34,17 +31,17 @@ void run_integration_tests() {
     add_grounded_action_to_cpp(1, pre_rpn, 1, eff_ids, eff_vals, 1, -1);
 
     // Verify the Bridge successfully wrote to C++ memory
-    assert(global_problem.total_predicates == 20);
-    assert(global_problem.actions.size() == 1);
+    assert(get_global_problem().total_predicates == 20);
+    assert(get_global_problem().actions.size() == 1);
 
 
     // ==============================================================================
     // PHASE 2: THE STATE (Simulate the Solver starting up)
     // ==============================================================================
-    PartiallySpecifiedState current_state(global_problem.total_predicates);
-    
+    PartiallySpecifiedState current_state(get_global_problem().total_predicates);
+
     // The solver reads the initial facts and sets them in the bitset
-    for (int fact_id : global_problem.initial_true_facts) {
+    for (int fact_id : get_global_problem().initial_true_facts) {
         current_state.set_known_value(fact_id, true);
     }
 
@@ -56,7 +53,7 @@ void run_integration_tests() {
     // ==============================================================================
     // PHASE 3: THE EVALUATOR (Simulate checking if the action is legal)
     // ==============================================================================
-    const GroundedAction& action = global_problem.actions[0];
+    const GroundedAction& action = get_global_problem().actions[0];
     
     // Check if the action's RPN is satisfied by the current bitset state
     bool is_legal = Evaluator::evaluate_rpn_raw(action.precondition_rpn, current_state);

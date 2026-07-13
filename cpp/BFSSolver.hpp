@@ -23,23 +23,31 @@ public:
      * @brief Executes an optimal Breadth-First Search from the current belief state.
      * @param current_state The epistemic state the agent is CURRENTLY in (do not use T0 initial facts).
      * @param problem The global problem definition.
+     * @param max_expansions Safety cap on nodes expanded. Callers doing genuine plan
+     *        extraction should keep the default; callers using this purely as a cheap
+     *        heuristic signal (e.g. CPORSolver::compute_heuristic, called once per
+     *        candidate action per search node) should pass a much smaller bound --
+     *        a full blind search to 100k nodes is not a heuristic, it's a second solver.
+     * @param verbose Emit progress/diagnostic logging. Disable for high-frequency
+     *        heuristic calls where per-call iostream flushes become their own overhead.
      * @return A sequence of Action IDs representing the shortest path to the goal. Empty if unsolvable.
      */
-    static std::vector<int> solve(const PartiallySpecifiedState& current_state, const ProblemDef& problem) {
-        
+    static std::vector<int> solve(const PartiallySpecifiedState& current_state, const ProblemDef& problem,
+                                   int max_expansions = 100000, bool verbose = true) {
+
         // Check if we are already at the goal
         if (Evaluator::evaluate(problem.goal_rpn, current_state, EvalMode::PESSIMISTIC)) {
-            std::cout << "[BFSSolver] Start state is already the goal." << std::endl;
+            if (verbose) std::cout << "[BFSSolver] Start state is already the goal." << std::endl;
             return {};
         }
 
         // Memory Arena: Preallocate to prevent vector reallocations and memory fragmentation
         std::vector<BFSNode> node_arena;
-        node_arena.reserve(100000); // Tune based on average problem size
+        node_arena.reserve(static_cast<size_t>(max_expansions) + 1); // Tune based on average problem size
 
         // Map state hash directly to its index in the node_arena
         std::unordered_map<PartiallySpecifiedState, int, StateHasher> visited;
-        
+
         // Queue stores INDICES to the arena, NOT copies of states or paths
         std::queue<int> open_list;
 
@@ -49,12 +57,16 @@ public:
         open_list.push(0);
 
         int expanded = 0;
-        const int MAX_EXPANSIONS = 100000;
+        const int MAX_EXPANSIONS = max_expansions;
 
         while (!open_list.empty()) {
             int current_index = open_list.front();
             open_list.pop();
-            const PartiallySpecifiedState& curr_state = node_arena[current_index].state;
+            // Must be a copy, not a reference: the loop below calls node_arena.push_back()
+            // repeatedly, and once node_arena grows past its initial reserve() capacity,
+            // reallocation invalidates any reference into it -- corrupting curr_state
+            // mid-iteration and causing a use-after-free read on later actions.
+            const PartiallySpecifiedState curr_state = node_arena[current_index].state;
 
             // Goal evaluation is done ON GENERATION below. 
             // We just expand the current node here.
@@ -71,8 +83,8 @@ public:
                         
                         // Goal Evaluation on PUSH (Optimal for BFS uniform cost)
                         if (Evaluator::evaluate(problem.goal_rpn, next_state, EvalMode::PESSIMISTIC)) {
-                            std::cout << "[BFSSolver] Goal found! Expanded " << expanded << " states." << std::endl;
-                            
+                            if (verbose) std::cout << "[BFSSolver] Goal found! Expanded " << expanded << " states." << std::endl;
+
                             // Reconstruct path
                             return reconstruct_path(current_index, action.id, node_arena);
                         }
@@ -89,12 +101,12 @@ public:
             
             expanded++;
             if (expanded >= MAX_EXPANSIONS) {
-                 std::cerr << "[BFSSolver] Safety limit reached (" << MAX_EXPANSIONS << " expansions). Aborting." << std::endl;
+                 if (verbose) std::cerr << "[BFSSolver] Safety limit reached (" << MAX_EXPANSIONS << " expansions). Aborting." << std::endl;
                  break;
             }
         }
-        
-        std::cout << "[BFSSolver] Search exhausted. No plan found." << std::endl;
+
+        if (verbose) std::cout << "[BFSSolver] Search exhausted. No plan found." << std::endl;
         return {};
     }
 

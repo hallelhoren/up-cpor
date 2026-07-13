@@ -5,9 +5,6 @@
 #include "../State.hpp"
 #include "../Evaluator.hpp"
 
-// Mock global problem required by State.hpp
-ProblemDef global_problem;
-
 // Simple macro to emulate GTest/Catch2 assertions
 #define TEST_CHECK(name, condition) \
     if (!(condition)) { \
@@ -18,10 +15,11 @@ ProblemDef global_problem;
     }
 
 void initialize_test_environment() {
-    global_problem.total_predicates = 10;
-    global_problem.total_functions = 0;
+    reset_global_problem();
+    get_global_problem().total_predicates = 10;
+    get_global_problem().total_functions = 0;
     int blocks = (10 / 64) + 1;
-    global_problem.comparable_mask.assign(blocks, ~0ULL);
+    get_global_problem().comparable_mask.assign(blocks, ~0ULL);
 }
 
 void test_three_valued_truth_tables() {

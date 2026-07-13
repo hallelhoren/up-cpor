@@ -148,6 +148,28 @@ BfsHashEntry_pointer lbfs_hash_entry[BFS_HASH_SIZE];
 
 
 
+/* first_call guards and their lazily-sized State/buffer state, for every
+ * search.c function that allocates on its first invocation. Kept at file
+ * scope (rather than function-local statics) so search_reset_for_new_problem()
+ * can re-arm them when a new problem is loaded into this thread -- these
+ * State buffers are sized once from whatever problem happened to trigger the
+ * first call and are never otherwise resized; reused as-is for a
+ * differently-sized problem loaded later in the same thread, they overflow. */
+static Bool s_ehc_first_call = TRUE;
+static State s_ehc_S, s_ehc_S_;
+static Bool s_search_for_better_state_first_call = TRUE;
+static State s_search_for_better_state_S__;
+static Bool s_expand_first_node_first_call = TRUE;
+static State s_expand_first_node_S_;
+static Bool s_do_best_first_search_first_call = TRUE;
+static State s_do_best_first_search_S;
+static Bool s_result_to_dest_first_call = TRUE;
+static Bool *s_result_to_dest_in_source, *s_result_to_dest_in_dest,
+            *s_result_to_dest_in_del, *s_result_to_dest_true_ef;
+static int *s_result_to_dest_del;
+
+
+
 
 
 
@@ -175,24 +197,18 @@ Bool do_enforced_hill_climbing( State *start, State *end )
 
 {
 
-  static Bool first_call = TRUE;
-  static State S, S_;
   int i, h, h_;
 
-  if ( first_call ) {
+  if ( s_ehc_first_call ) {
     /* on first call, initialize plan hash table, search space, search hash table
      */
     for ( i = 0; i < PLAN_HASH_SIZE; i++ ) {
       lplan_hash_entry[i] = NULL;
     }
-    /* on subsequent calls, the start is already hashed, as it's the end
-     * of the previous calls
-     */
-    hash_plan_state( start, 0 );
-    
+
     lehc_space_head = new_EhcNode();
     lehc_space_end = lehc_space_head;
-    
+
     for ( i = 0; i < EHC_HASH_SIZE; i++ ) {
       lehc_hash_entry[i] = NULL;
       lnum_ehc_hash_entry[i] = 0;
@@ -200,42 +216,53 @@ Bool do_enforced_hill_climbing( State *start, State *end )
     }
     lnum_changed_ehc_entrys = 0;
 
-    make_state( &S, gnum_ft_conn ); 
-    S.max_F = gnum_ft_conn;
-    make_state( &S_, gnum_ft_conn );
-    S_.max_F = gnum_ft_conn;
+    make_state( &s_ehc_S, gnum_ft_conn );
+    s_ehc_S.max_F = gnum_ft_conn;
+    make_state( &s_ehc_S_, gnum_ft_conn );
+    s_ehc_S_.max_F = gnum_ft_conn;
 
     make_state( &lcurrent_goals, gnum_ft_conn );
     lcurrent_goals.max_F = gnum_ft_conn;
 
-    first_call = FALSE;
+    s_ehc_first_call = FALSE;
   }
-  
+
+  /* FF's original comment here read "on subsequent calls, the start is
+   * already hashed, as it's the end of the previous calls" -- true for FF's
+   * intended usage (chained sub-searches within one planning episode, where
+   * each call's start is the previous call's reached state). Not true for
+   * us: every call is an independent heuristic evaluation from an unrelated
+   * witness state, so the start state must be hashed every time, not just
+   * on the very first call ever made in this process. */
+  hash_plan_state( start, 0 );
+
+
   /* start enforced Hill-climbing
    */
 
   source_to_dest( &lcurrent_goals, end );  
 
-  source_to_dest( &S, start );
-  h = get_1P_and_H( &S, &lcurrent_goals );
+  source_to_dest( &s_ehc_S, start );
+  h = get_1P_and_H( &s_ehc_S, &lcurrent_goals );
 
   if ( h == INFINITY ) {
     return FALSE;
   }
   if ( h == 0 ) {
     return TRUE;
-  }  
-  printf("\n\nCueing down from goal distance: %4d into depth ", h);
-  fflush(stdout);
+  }
+  /* Progress logging removed: get_1P_and_H/do_enforced_hill_climbing is now
+   * invoked as a heuristic call from CPORSolver::compute_heuristic, once per
+   * applicable action per search node -- these printfs would otherwise flood
+   * stdout and add their own I/O overhead at that call frequency. Behavior is
+   * unchanged, only the diagnostic printing is suppressed. */
 
   while ( h != 0 ) {
-    if ( !search_for_better_state( &S, h, &S_, &h_ ) ) {
+    if ( !search_for_better_state( &s_ehc_S, h, &s_ehc_S_, &h_ ) ) {
       return FALSE;
     }
-    source_to_dest( &S, &S_ );
+    source_to_dest( &s_ehc_S, &s_ehc_S_ );
     h = h_;
-    printf("\n                                %4d            ", h);
-    fflush(stdout);
   }
 
   return TRUE;
@@ -272,16 +299,13 @@ Bool search_for_better_state( State *S, int h, State *S_, int *h_ )
 
 {
 
-  static Bool first_call = TRUE;
-  static State S__;
-
   int i, h__, depth = 0, g;
   EhcNode *tmp;
 
-  if ( first_call ) {
-    make_state( &S__, gnum_ft_conn );
-    S__.max_F = gnum_ft_conn;
-    first_call = FALSE;
+  if ( s_search_for_better_state_first_call ) {
+    make_state( &s_search_for_better_state_S__, gnum_ft_conn );
+    s_search_for_better_state_S__.max_F = gnum_ft_conn;
+    s_search_for_better_state_first_call = FALSE;
   }
 
   /* don't hash states, but search nodes.
@@ -293,15 +317,23 @@ Bool search_for_better_state( State *S, int h, State *S_, int *h_ )
 
   lehc_current_end = lehc_space_head->next;
   for ( i = 0; i < gnum_H; i++ ) {
-    g = result_to_dest( &S__, S, gH[i] );
-    add_to_ehc_space( &S__, gH[i], NULL, g );
+    g = result_to_dest( &s_search_for_better_state_S__, S, gH[i] );
+    add_to_ehc_space( &s_search_for_better_state_S__, gH[i], NULL, g );
   }
   lehc_current_start = lehc_space_head->next;
 
-  while ( TRUE ) {  
+  while ( TRUE ) {
     if ( lehc_current_start == lehc_current_end ) {
       reset_ehc_hash_entrys();
-      free( tmp );
+      /* tmp was linked into the EHC hash table by hash_ehc_node() above --
+       * freeing it here (the original code did) leaves a dangling pointer in
+       * lehc_hash_entry[], which is only invisible if the process exits
+       * right after (FF's original one-shot-executable design). Called
+       * repeatedly in one process, as our C++ engine does, the next
+       * ff_reset_search_state()/ff_clear_hash_table() call walks that stale
+       * entry and crashes. ff_clear_hash_table() already reclaims
+       * ehc_node->S.F for every hashed node (see its own comment); ownership
+       * of tmp itself belongs to the hash table from here on, not to us. */
       return FALSE;
     }
     if ( lehc_current_start->depth > depth ) {
@@ -309,8 +341,6 @@ Bool search_for_better_state( State *S, int h, State *S_, int *h_ )
       if ( depth > gmax_search_depth ) {
 	gmax_search_depth = depth;
       }
-      printf("[%d]", depth);
-      fflush( stdout );
     }
     h__ = expand_first_node( h );
     if ( LESS( h__, h ) ) {
@@ -319,7 +349,7 @@ Bool search_for_better_state( State *S, int h, State *S_, int *h_ )
   }
 
   reset_ehc_hash_entrys();
-  free( tmp );
+  /* See the comment above: tmp is owned by the EHC hash table now. */
 
   extract_plan_fragment( S );
 
@@ -370,19 +400,16 @@ int expand_first_node( int h )
 
 {
 
-  static Bool fc = TRUE;
-  static State S_;
-
   int h_, i, g;
 
-  if ( fc ) {
-    make_state( &S_, gnum_ft_conn );
-    S_.max_F = gnum_ft_conn;
-    fc = FALSE;
+  if ( s_expand_first_node_first_call ) {
+    make_state( &s_expand_first_node_S_, gnum_ft_conn );
+    s_expand_first_node_S_.max_F = gnum_ft_conn;
+    s_expand_first_node_first_call = FALSE;
   }
 
   h_ = get_1P_and_H( &(lehc_current_start->S), &lcurrent_goals );
-    
+
   if ( h_ == INFINITY ) {
     lehc_current_start = lehc_current_start->next;
     return h_;
@@ -399,8 +426,8 @@ int expand_first_node( int h )
   }
 
   for ( i = 0; i < gnum_H; i++ ) {
-    g = result_to_dest( &S_, &(lehc_current_start->S), gH[i] );
-    add_to_ehc_space( &S_, gH[i], lehc_current_start, g );
+    g = result_to_dest( &s_expand_first_node_S_, &(lehc_current_start->S), gH[i] );
+    add_to_ehc_space( &s_expand_first_node_S_, gH[i], lehc_current_start, g );
   }
     
   lehc_current_start = lehc_current_start->next;
@@ -816,17 +843,14 @@ Bool do_best_first_search( void )
 
 {
 
-  static Bool fc = TRUE;
-  static State S;
-
   BfsNode *first;
   int i, min = INFINITY;
   Bool start = TRUE;
 
-  if ( fc ) {
-    make_state( &S, gnum_ft_conn );
-    S.max_F = gnum_ft_conn;
-    fc = FALSE;
+  if ( s_do_best_first_search_first_call ) {
+    make_state( &s_do_best_first_search_S, gnum_ft_conn );
+    s_do_best_first_search_S.max_F = gnum_ft_conn;
+    s_do_best_first_search_first_call = FALSE;
   }
 
   lbfs_space_head = new_BfsNode();
@@ -851,14 +875,8 @@ Bool do_best_first_search( void )
 
     if ( LESS( first->h, min ) ) {
       min = first->h;
-      if ( start ) {
-	printf("\nadvancing to distance : %4d", min);
-	fflush(stdout);
-	start = FALSE;
-      } else {
-	printf("\n                        %4d", min);
-	fflush(stdout);
-      }
+      /* Progress logging removed -- see do_enforced_hill_climbing for why. */
+      start = FALSE;
     }
 
     if ( first->h == 0 ) {
@@ -867,8 +885,8 @@ Bool do_best_first_search( void )
 
     get_A( &(first->S) );
     for ( i = 0; i < gnum_A; i++ ) {
-      result_to_dest( &S, &(first->S), gA[i] );
-      add_to_bfs_space( &S, gA[i], first );
+      result_to_dest( &s_do_best_first_search_S, &(first->S), gA[i] );
+      add_to_bfs_space( &s_do_best_first_search_S, gA[i], first );
     }
 
     first->next = lbfs_space_had;
@@ -1068,34 +1086,31 @@ int result_to_dest( State *dest, State *source, int op )
 
 {
 
-  static Bool first_call = TRUE;
-  static Bool *in_source, *in_dest, *in_del, *true_ef;
-  static int *del, num_del;
-
   int i, j, ef;
   int r = -1;
-  
-  if ( first_call ) {
-    in_source = ( Bool * ) calloc( gnum_ft_conn, sizeof( Bool ) );
-    in_dest = ( Bool * ) calloc( gnum_ft_conn, sizeof( Bool ) );
-    in_del = ( Bool * ) calloc( gnum_ft_conn, sizeof( Bool ) );
-    true_ef = ( Bool * ) calloc( gnum_ef_conn, sizeof( Bool ) );
-    del = ( int * ) calloc( gnum_ft_conn, sizeof( int ) );
+  int num_del;
+
+  if ( s_result_to_dest_first_call ) {
+    s_result_to_dest_in_source = ( Bool * ) calloc( gnum_ft_conn, sizeof( Bool ) );
+    s_result_to_dest_in_dest = ( Bool * ) calloc( gnum_ft_conn, sizeof( Bool ) );
+    s_result_to_dest_in_del = ( Bool * ) calloc( gnum_ft_conn, sizeof( Bool ) );
+    s_result_to_dest_true_ef = ( Bool * ) calloc( gnum_ef_conn, sizeof( Bool ) );
+    s_result_to_dest_del = ( int * ) calloc( gnum_ft_conn, sizeof( int ) );
     for ( i = 0; i < gnum_ft_conn; i++ ) {
-      in_source[i] = FALSE;
-      in_dest[i] = FALSE;
-      in_del[i] = FALSE;
+      s_result_to_dest_in_source[i] = FALSE;
+      s_result_to_dest_in_dest[i] = FALSE;
+      s_result_to_dest_in_del[i] = FALSE;
     }
     for ( i = 0; i < gnum_ef_conn; i++ ) {
-      true_ef[i] = FALSE;
+      s_result_to_dest_true_ef[i] = FALSE;
     }
-    first_call = FALSE;
+    s_result_to_dest_first_call = FALSE;
   }
 
   /* setup true facts for effect cond evaluation
    */
   for ( i = 0; i < source->num_F; i++ ) {
-    in_source[source->F[i]] = TRUE;
+    s_result_to_dest_in_source[source->F[i]] = TRUE;
   }
 
   /* setup deleted facts
@@ -1104,14 +1119,14 @@ int result_to_dest( State *dest, State *source, int op )
   for ( i = 0; i < gop_conn[op].num_E; i++ ) {
     ef = gop_conn[op].E[i];
     for ( j = 0; j < gef_conn[ef].num_PC; j++ ) {
-      if ( !in_source[gef_conn[ef].PC[j]] ) break;
+      if ( !s_result_to_dest_in_source[gef_conn[ef].PC[j]] ) break;
     }
     if ( j < gef_conn[ef].num_PC ) continue;
-    true_ef[i] = TRUE;
+    s_result_to_dest_true_ef[i] = TRUE;
     for ( j = 0; j < gef_conn[ef].num_D; j++ ) {
-      if ( in_del[gef_conn[ef].D[j]] ) continue;
-      in_del[gef_conn[ef].D[j]] = TRUE;
-      del[num_del++] = gef_conn[ef].D[j];
+      if ( s_result_to_dest_in_del[gef_conn[ef].D[j]] ) continue;
+      s_result_to_dest_in_del[gef_conn[ef].D[j]] = TRUE;
+      s_result_to_dest_del[num_del++] = gef_conn[ef].D[j];
     }
   }
 
@@ -1122,25 +1137,25 @@ int result_to_dest( State *dest, State *source, int op )
    */
   dest->num_F = 0;
   for ( i = 0; i < source->num_F; i++ ) {
-    if ( in_del[source->F[i]] ) {
+    if ( s_result_to_dest_in_del[source->F[i]] ) {
       continue;
     }
     dest->F[dest->num_F++] = source->F[i];
-    in_dest[source->F[i]] = TRUE;
+    s_result_to_dest_in_dest[source->F[i]] = TRUE;
   }
 
-  /* now, finally, add all fullfilled effect adds to dest; 
+  /* now, finally, add all fullfilled effect adds to dest;
    * each fact at most once!
    */
   for ( i = 0; i < gop_conn[op].num_E; i++ ) {
-    if ( !true_ef[i] ) continue;
+    if ( !s_result_to_dest_true_ef[i] ) continue;
     ef = gop_conn[op].E[i];
     for ( j = 0; j < gef_conn[ef].num_A; j++ ) {
-      if ( in_dest[gef_conn[ef].A[j]] ) {
+      if ( s_result_to_dest_in_dest[gef_conn[ef].A[j]] ) {
 	continue;
       }
       dest->F[dest->num_F++] = gef_conn[ef].A[j];
-      in_dest[gef_conn[ef].A[j]] = TRUE;
+      s_result_to_dest_in_dest[gef_conn[ef].A[j]] = TRUE;
       if ( gft_conn[gef_conn[ef].A[j]].is_global_goal ) {
 	r = gef_conn[ef].A[j];
       }
@@ -1150,16 +1165,16 @@ int result_to_dest( State *dest, State *source, int op )
   /* unset infos
    */
   for ( i = 0; i < source->num_F; i++ ) {
-    in_source[source->F[i]] = FALSE;
+    s_result_to_dest_in_source[source->F[i]] = FALSE;
   }
   for ( i = 0; i < dest->num_F; i++ ) {
-    in_dest[dest->F[i]] = FALSE;
+    s_result_to_dest_in_dest[dest->F[i]] = FALSE;
   }
   for ( i = 0; i < num_del; i++ ) {
-    in_del[del[i]] = FALSE;
+    s_result_to_dest_in_del[s_result_to_dest_del[i]] = FALSE;
   }
   for ( i = 0; i < gop_conn[op].num_E; i++ ) {
-    true_ef[i] = FALSE;
+    s_result_to_dest_true_ef[i] = FALSE;
   }
 
   return r;
@@ -1239,10 +1254,19 @@ void ff_clear_hash_table(void) {
         ehc_current = lehc_hash_entry[i];
         while (ehc_current != NULL) {
             ehc_next = ehc_current->next;
-            // The State 'S' is inside 'ehc_node'
+            // The State 'S' is inside 'ehc_node'. This EhcNode is still
+            // linked into the persistent lehc_space_head list (never freed,
+            // only its hash-table entry is) and will be reused by a future
+            // search via add_to_ehc_space(). max_F/num_F must be reset
+            // alongside F -- copy_source_to_dest() trusts max_F to reflect
+            // F's actual allocated capacity and skips reallocating when it
+            // looks sufficient, which crashes if F was freed but max_F was
+            // left stale.
             if (ehc_current->ehc_node != NULL && ehc_current->ehc_node->S.F != NULL) {
                 free(ehc_current->ehc_node->S.F);
                 ehc_current->ehc_node->S.F = NULL;
+                ehc_current->ehc_node->S.max_F = 0;
+                ehc_current->ehc_node->S.num_F = 0;
             }
             free(ehc_current);
             ehc_current = ehc_next;
@@ -1256,14 +1280,110 @@ void ff_clear_hash_table(void) {
         bfs_current = lbfs_hash_entry[i];
         while (bfs_current != NULL) {
             bfs_next = bfs_current->next;
-            // The State 'S' is inside 'bfs_node'
+            // The State 'S' is inside 'bfs_node'. Same reasoning as the EHC
+            // case above: reset max_F/num_F alongside F.
             if (bfs_current->bfs_node != NULL && bfs_current->bfs_node->S.F != NULL) {
                 free(bfs_current->bfs_node->S.F);
                 bfs_current->bfs_node->S.F = NULL;
+                bfs_current->bfs_node->S.max_F = 0;
+                bfs_current->bfs_node->S.num_F = 0;
             }
             free(bfs_current);
             bfs_current = bfs_next;
         }
         lbfs_hash_entry[i] = NULL;
     }
+
+    // 3. Clear the plan-state hash table (lplan_hash_entry). do_enforced_hill_climbing
+    // hashes its `start` state here on every call (see the comment there), and
+    // hash_plan_state() hard exit(1)s if it's asked to re-hash a state already
+    // marked as part of a completed plan (step != -1). FF's original design only
+    // ever cleared this table once per process (a fresh table on first_call);
+    // called repeatedly with independent witness states, as our C++ engine does,
+    // two unrelated searches can legitimately pass the same state, and without
+    // clearing this table between searches that collision aborts the process.
+    {
+        PlanHashEntry_pointer plan_current, plan_next;
+        for (i = 0; i < PLAN_HASH_SIZE; i++) {
+            plan_current = lplan_hash_entry[i];
+            while (plan_current != NULL) {
+                plan_next = plan_current->next;
+                if (plan_current->S.F != NULL) {
+                    free(plan_current->S.F);
+                }
+                free(plan_current);
+                plan_current = plan_next;
+            }
+            lplan_hash_entry[i] = NULL;
+        }
+    }
+}
+
+/*
+ * See the doc comment on this function in search.h. Frees each lazily-sized
+ * State/buffer that a first_call-guarded search.c function has allocated for
+ * the problem that was loaded before this one, and re-arms every first_call
+ * guard so the next call to each of those functions rebuilds them sized to
+ * the new problem's gnum_ft_conn/gnum_ef_conn.
+ */
+void search_reset_for_new_problem(void) {
+    if (s_ehc_S.F) { free(s_ehc_S.F); s_ehc_S.F = NULL; s_ehc_S.max_F = 0; s_ehc_S.num_F = 0; }
+    if (s_ehc_S_.F) { free(s_ehc_S_.F); s_ehc_S_.F = NULL; s_ehc_S_.max_F = 0; s_ehc_S_.num_F = 0; }
+    s_ehc_first_call = TRUE;
+
+    if (s_search_for_better_state_S__.F) {
+        free(s_search_for_better_state_S__.F);
+        s_search_for_better_state_S__.F = NULL;
+        s_search_for_better_state_S__.max_F = 0;
+        s_search_for_better_state_S__.num_F = 0;
+    }
+    s_search_for_better_state_first_call = TRUE;
+
+    if (s_expand_first_node_S_.F) {
+        free(s_expand_first_node_S_.F);
+        s_expand_first_node_S_.F = NULL;
+        s_expand_first_node_S_.max_F = 0;
+        s_expand_first_node_S_.num_F = 0;
+    }
+    s_expand_first_node_first_call = TRUE;
+
+    if (s_do_best_first_search_S.F) {
+        free(s_do_best_first_search_S.F);
+        s_do_best_first_search_S.F = NULL;
+        s_do_best_first_search_S.max_F = 0;
+        s_do_best_first_search_S.num_F = 0;
+    }
+    s_do_best_first_search_first_call = TRUE;
+
+    if (s_result_to_dest_in_source) { free(s_result_to_dest_in_source); s_result_to_dest_in_source = NULL; }
+    if (s_result_to_dest_in_dest) { free(s_result_to_dest_in_dest); s_result_to_dest_in_dest = NULL; }
+    if (s_result_to_dest_in_del) { free(s_result_to_dest_in_del); s_result_to_dest_in_del = NULL; }
+    if (s_result_to_dest_true_ef) { free(s_result_to_dest_true_ef); s_result_to_dest_true_ef = NULL; }
+    if (s_result_to_dest_del) { free(s_result_to_dest_del); s_result_to_dest_del = NULL; }
+    s_result_to_dest_first_call = TRUE;
+
+    /* lcurrent_goals (relax.c) and lehc_space_head/lplan_hash_entry etc. are
+     * already handled: lcurrent_goals is (re)allocated by do_enforced_hill_climbing's
+     * own first_call block above, which s_ehc_first_call = TRUE just re-armed;
+     * the EHC/BFS/plan hash tables and lehc_space_head are rebuilt by that
+     * same block and don't hold problem-sized buffers of their own.
+     *
+     * KNOWN LEAK, INTENTIONALLY NOT FIXED HERE: lehc_space_head/lehc_space_end
+     * (EhcNode arena) and lbfs_space_head/lbfs_space_had (BfsNode arena) are
+     * abandoned, not freed, when a new problem overwrites these pointers via the
+     * first_call rebuild triggered above -- confirmed via code review. A
+     * straightforward "walk the chain and free every node" fix was attempted and
+     * reproducibly segfaulted on the second problem load in the same process
+     * (crash inside the following search, consistent with heap corruption from a
+     * double-free): lbfs_space_head is reassigned to a *fresh* new_BfsNode() on
+     * EVERY do_best_first_search() call, not just the first (see that function --
+     * this is pre-existing FF-v2.3 behavior, not introduced this session), and
+     * lbfs_space_had is never reset between those calls either, so within a
+     * single problem's lifetime (compute_heuristic can trigger many
+     * do_best_first_search calls) the true ownership/aliasing of these chains is
+     * more complex than a single linear list -- unwinding that safely is a
+     * distinct, deeper piece of FF-v2.3 lifecycle work than this fix's scope.
+     * The leak itself is bounded (at most one abandoned arena per problem load,
+     * not per search step) and fully reclaimed at process exit; leaving it
+     * documented rather than risking the crash is the safer trade-off. */
 }

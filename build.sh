@@ -3,7 +3,7 @@
 echo "=================================="
 echo "1. Building C# CPORLib..."
 echo "=================================="
-#dotnet build CPORLib/CPORLibSolution.sln
+dotnet build CPORLib/CPORLibSolution.sln
 
 echo "=================================="
 echo "2. Building C++ Native Core..."

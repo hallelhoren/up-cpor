@@ -7,22 +7,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(FF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../FF-v2.3")
 include_directories(${FF_DIR})
 
-# Legacy FF Source Files (Untouched)
-set(FF_SOURCES 
-    ${FF_DIR}/ff_api.c ${FF_DIR}/search.c ${FF_DIR}/relax.c 
-    ${FF_DIR}/parse.c ${FF_DIR}/inst_easy.c ${FF_DIR}/inst_hard.c 
-    ${FF_DIR}/inst_final.c ${FF_DIR}/inst_pre.c ${FF_DIR}/orderings.c 
+# Legacy FF Source Files. ff_api.c and search.c now carry a real
+# ff_load_problem() bridge (replacing the empty make_search_space() stub) and
+# a fix for a wrong argument passed to do_enforced_hill_climbing; relax.c,
+# memory.c, and the inst_*.c grounding pipeline (unused -- we bypass FF's own
+# PDDL instantiation and write directly to its connectivity graph) remain
+# untouched.
+set(FF_SOURCES
+    ${FF_DIR}/ff_api.c ${FF_DIR}/search.c ${FF_DIR}/relax.c
+    ${FF_DIR}/parse.c ${FF_DIR}/inst_easy.c ${FF_DIR}/inst_hard.c
+    ${FF_DIR}/inst_final.c ${FF_DIR}/inst_pre.c ${FF_DIR}/orderings.c
     ${FF_DIR}/output.c ${FF_DIR}/memory.c
 )
 
 # Create FF Engine Library
 add_library(ff_engine STATIC ${FF_SOURCES})
 set_property(TARGET ff_engine PROPERTY POSITION_INDEPENDENT_CODE ON)
-set_source_files_properties(${FF_SOURCES} PROPERTIES COMPILE_FLAGS "-w -fcommon") 
+set_source_files_properties(${FF_SOURCES} PROPERTIES COMPILE_FLAGS "-w -fcommon")
 
 # Create your C++ Library (Now including ff_globals.c!)
-add_library(cpor_core SHARED 
-    native_bridge.cpp CPORSolver.cpp FFSolver.cpp SDRSampler.cpp 
+add_library(cpor_core SHARED
+    native_bridge.cpp CPORSolver.cpp FFSolver.cpp FFBridge.cpp SDRSampler.cpp
     SDRPlanner.cpp BeliefState.cpp ff_globals.c
 )
 
@@ -44,3 +49,6 @@ target_link_libraries(test_integration PRIVATE cpor_core z3)
 
 add_executable(test_sdr_full_lifecycle tests/test_sdr_full_lifecycle.cpp)
 target_link_libraries(test_sdr_full_lifecycle PRIVATE cpor_core z3)
+
+add_executable(test_cpor_loop tests/test_cpor_loop.cpp)
+target_link_libraries(test_cpor_loop PRIVATE cpor_core z3)
