@@ -5,7 +5,28 @@
 #include <cstring>
 #include <limits>
 #include <cmath>
+#include <unordered_map>
 #include "ProblemData.hpp"
+
+/**
+ * @struct ConditionalProvenance
+ * @brief Remembers that a fact went unknown because a conditional effect's
+ * condition was itself unknown at apply time (ActionApplier's "Knowledge
+ * Loss" rule) -- so that a LATER direct observation of that fact can be
+ * abduced backward into the condition fact. Scoped to single-fact
+ * (optionally negated) conditions only; see ActionApplier::apply_action.
+ */
+struct ConditionalProvenance {
+    int condition_fact_id{-1};
+    bool effect_value{false};
+    bool condition_negated{false};
+
+    bool operator==(const ConditionalProvenance& other) const {
+        return condition_fact_id == other.condition_fact_id &&
+               effect_value == other.effect_value &&
+               condition_negated == other.condition_negated;
+    }
+};
 
 /**
  * @class PartiallySpecifiedState
@@ -14,10 +35,14 @@
  */
 class PartiallySpecifiedState {
 public:
-    std::vector<uint64_t> known_mask; 
+    std::vector<uint64_t> known_mask;
     std::vector<uint64_t> value_mask;
     std::vector<uint64_t> known_function_mask;
     std::vector<double> function_values;
+
+    // Pending conditional-effect provenance, keyed by the effect (target)
+    // fact id. See ConditionalProvenance and apply_provenance_deductions().
+    std::unordered_map<int, ConditionalProvenance> pending_provenance;
 
     PartiallySpecifiedState() = default;
 
@@ -86,13 +111,26 @@ public:
         return !(known_mask[id / 64] & (1ULL << (id % 64)));
     }
     
-    // Applying an observation or effect
+    // Applying an observation or effect. Deliberately does NOT touch
+    // pending_provenance: genuine observations go through this exact method
+    // and must leave any pending entry for `id` intact so
+    // apply_provenance_deductions() can still read it afterward. Forward,
+    // non-observation writes that should invalidate a stale entry (an
+    // unrelated action directly (re)setting this fact) call
+    // clear_provenance() explicitly instead -- see ActionApplier.
     void set_known_value(int id, bool value) {
         known_mask[id / 64] |= (1ULL << (id % 64)); // Mark as known (1)
-        if (value) 
+        if (value)
             value_mask[id / 64] |= (1ULL << (id % 64)); // Set True
-        else 
+        else
             value_mask[id / 64] &= ~(1ULL << (id % 64)); // Set False
+    }
+
+    // Explicitly discards a stale provenance entry -- used when an
+    // unrelated forward mechanism (not an observation) resolves this fact,
+    // making any earlier pending abduction for it moot.
+    void clear_provenance(int id) {
+        if (!pending_provenance.empty()) pending_provenance.erase(id);
     }
 
     // Equality operator masking out ignored variables dynamically
@@ -112,18 +150,87 @@ public:
             if (function_values[i] != other.function_values[i]) return false;
         }
 
+        // Two bitmask-identical states can still carry different pending
+        // abduction opportunities (e.g. one reached this state via a
+        // knowledge-loss conditional effect, the other never triggered
+        // it) -- caching them as equal would let a deduction available on
+        // one path get silently lost by reusing a cached result computed
+        // on the other. std::unordered_map::operator== is content-equality
+        // (order-independent), so this is safe to compare directly.
+        if (pending_provenance != other.pending_provenance) return false;
+
         return true;
     }
 
     // Forces a fact into the UNKNOWN state (used for Knowledge Loss and Non-Determinism)
     void set_unknown(int id) {
     uint64_t bit = 1ULL << (id % 64);
-    
-    // Canonicalize state to prevent SIMD/bitwise corruption 
+
+    // Canonicalize state to prevent SIMD/bitwise corruption
     // during bulk action application in later phases.
-    known_mask[id / 64] &= ~bit; 
-    value_mask[id / 64] &= ~bit; 
+    known_mask[id / 64] &= ~bit;
+    value_mask[id / 64] &= ~bit;
+    // A fresh degradation supersedes any older, now-stale provenance
+    // recorded for this same fact (e.g. non-determinism after an earlier
+    // knowledge-loss branch, or a repeated conditional-effect hit).
+    if (!pending_provenance.empty()) pending_provenance.erase(id);
 }
+
+    // Records that `effect_fact_id` would become `effect_value` if
+    // `condition_fact_id` turns out (or, if `condition_negated`, turns out
+    // NOT) to be true -- called by ActionApplier right after set_unknown()
+    // degrades `effect_fact_id` because its conditional effect's condition
+    // was itself unknown. Overwrites any prior entry for the same fact.
+    void record_conditional_provenance(int effect_fact_id, int condition_fact_id, bool effect_value, bool condition_negated = false) {
+        pending_provenance[effect_fact_id] = ConditionalProvenance{condition_fact_id, effect_value, condition_negated};
+    }
+
+    // Scoped regression fix: abduces a conditional effect's condition fact
+    // from a LATER direct observation of its (previously knowledge-loss-
+    // unknown) effect fact -- e.g. sensing `stainp(sK)` lets the engine
+    // deduce `ill(iK)` in medpks-style diagnosis domains, which the
+    // "Knowledge Loss" rule in ActionApplier alone can never recover.
+    //
+    // Deliberately one-directional: only effect-observed -> condition-
+    // deduced, never the reverse (condition-becomes-known -> forward-
+    // resolve effect). The condition fact may be a static hidden trait (as
+    // in diagnosis domains) or a fluent a later action legitimately
+    // changes, and this engine has no way to tell the two apart -- forward-
+    // resolving from a *later* known condition value would silently assume
+    // "static," which is unsound for the dynamic case. Call only at genuine
+    // observation sites (sensing), where the just-learned fact is known to
+    // reflect the world's ground truth, not an internal derivation.
+    //
+    // Loops to a fixpoint since resolving one condition fact can itself be
+    // the effect fact of an earlier, still-pending provenance entry
+    // (chained diagnosis). Cheap no-op whenever pending_provenance is empty
+    // (the common case for domains without this pattern).
+    bool apply_provenance_deductions() {
+        if (pending_provenance.empty()) return false;
+        bool any_changed = false;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (auto it = pending_provenance.begin(); it != pending_provenance.end(); ) {
+                int effect_fact_id = it->first;
+                if (is_unknown(effect_fact_id)) {
+                    ++it;
+                    continue;
+                }
+                ConditionalProvenance prov = it->second;
+                it = pending_provenance.erase(it);
+                if (is_unknown(prov.condition_fact_id)) {
+                    bool observed = is_true(effect_fact_id);
+                    bool condition_was_true = (observed == prov.effect_value);
+                    bool deduced_condition = prov.condition_negated ? !condition_was_true : condition_was_true;
+                    set_known_value(prov.condition_fact_id, deduced_condition);
+                }
+                changed = true;
+                any_changed = true;
+            }
+        }
+        return any_changed;
+    }
 
     // Applies SDR Logical Deduction across all OneOf constraints
     // Returns false if a logical contradiction is found (dead-end state)
@@ -236,6 +343,23 @@ struct StateHasher {
                 hash_combine(seed, std::hash<uint64_t>{}(canonical_bits));
             }
         }
+
+        // Hash pending provenance order-independently (XOR per-entry hashes
+        // together, since unordered_map iteration order isn't guaranteed to
+        // match across two equal-content maps) -- must agree with
+        // operator=='s content-equality check above. No-op when empty, so
+        // this doesn't change the hash for the common case (domains without
+        // this pattern never populate pending_provenance).
+        std::size_t provenance_seed = 0;
+        for (const auto& kv : s.pending_provenance) {
+            std::size_t entry_seed = 0;
+            hash_combine(entry_seed, std::hash<int>{}(kv.first));
+            hash_combine(entry_seed, std::hash<int>{}(kv.second.condition_fact_id));
+            hash_combine(entry_seed, std::hash<bool>{}(kv.second.effect_value));
+            hash_combine(entry_seed, std::hash<bool>{}(kv.second.condition_negated));
+            provenance_seed ^= entry_seed;
+        }
+        hash_combine(seed, provenance_seed);
 
         return seed;
     }

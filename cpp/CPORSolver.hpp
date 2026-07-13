@@ -112,20 +112,66 @@ private:
     // currently applicable.
     int find_resolving_sensing_action(const std::vector<int>& blocked_precondition_rpn, const PartiallySpecifiedState& belief);
 
+    // How many classical (non-sensing) actions find_resolving_sensing_action_via_prefix
+    // is willing to chain before giving up on a "navigate-then-sense" resolution
+    // and letting the caller fall back to the exhaustive search instead. Kept
+    // small deliberately: this is a local, non-backtracking forward search (see
+    // its own comment), not a substitute for solve_from_node -- it should stay
+    // far cheaper than the fallback it's trying to avoid, not become a second
+    // source of combinatorial blowup.
+    static constexpr int MAX_SENSING_PREFIX_DEPTH = 3;
+
+    // Extends find_resolving_sensing_action to cover sensing actions that
+    // AREN'T applicable yet at `belief` but become applicable after a short
+    // prefix of definitely-applicable classical actions -- e.g. a domain where
+    // sensing a package's location requires first driving a truck to that
+    // location (find_resolving_sensing_action alone only ever finds a sensing
+    // action that's already applicable *right now*, so it punts the whole
+    // subtree to the exhaustive fallback on any domain shaped like this; see
+    // solve_cpor_loop's class-level comment and this method's .cpp definition
+    // for the concrete clog/elog case that motivated it).
+    //
+    // Bounded forward search (breadth-first by depth, deduplicated by belief
+    // state, capped at MAX_SENSING_PREFIX_DEPTH): tries find_resolving_sensing_action
+    // at `belief` itself first (the cheap, common case), then explores chains
+    // of classical actions whose preconditions are already PESSIMISTIC-true
+    // (so the chain is safe to commit to regardless of how the *targeted*
+    // uncertainty eventually resolves), checking after each step whether a
+    // resolver has become applicable. On success returns the resolving
+    // sensing action's id and fills out_prefix_actions with the classical
+    // action id sequence needed to reach it (empty if no prefix was needed).
+    // Returns -1 (out_prefix_actions left untouched) if nothing is reachable
+    // within the depth cap -- the caller should fall back as before.
+    int find_resolving_sensing_action_via_prefix(const std::vector<int>& blocked_precondition_rpn,
+                                                   const PartiallySpecifiedState& belief,
+                                                   std::vector<int>& out_prefix_actions);
+
     // Attempts to turn a blocked/truncated action (blocking_action_id, as
     // surfaced by SDRPlanner::compute_linear_plan's out_blocking_action_id,
     // or discovered directly during partial-plan replay) into a genuine
-    // sensing branch at cursor_idx: looks up a resolving sensing action via
-    // find_resolving_sensing_action and, if one is applicable, branches via
-    // expand_sensing_node and pushes both new children onto open_stack.
+    // sensing branch at cursor_idx: looks up a resolving sensing action (and,
+    // if needed, a short navigate-then-sense prefix reaching one) via
+    // find_resolving_sensing_action_via_prefix and, if one is found, chains
+    // any prefix actions as ordinary classical nodes and then branches via
+    // expand_sensing_node, pushing both new children onto open_stack.
+    //
+    // blocking_fact_tokens (optional) is the fallback signal for when
+    // blocking_action_id is -1 -- i.e. compute_linear_plan had no specific
+    // action to blame (FFSolver::search itself returned nothing for the
+    // guide witness) -- coming from its own out_blocking_fact_tokens. Tried
+    // only if the blocking_action_id path doesn't resolve anything, so this
+    // never changes behavior for the doors7-style case the action-id path
+    // already covers.
+    //
     // Returns true if a branch was created (caller must not also fall back
-    // for this node); false if blocking_action_id is -1 or no resolving
-    // sensing action is currently applicable (caller should fall back).
-    // Shared by all three of solve_cpor_loop's truncation exit points so the
-    // "found a blocked action -> try to resolve it via sensing" logic can't
-    // drift out of sync between them.
+    // for this node); false if neither signal yields a sensing action
+    // reachable within the prefix-search depth cap (caller should fall
+    // back). Shared by all three of solve_cpor_loop's truncation exit points
+    // so the "found a blocked action -> try to resolve it via sensing" logic
+    // can't drift out of sync between them.
     bool try_resolve_via_sensing_branch(int cursor_idx, int blocking_action_id, const PartiallySpecifiedState& belief,
-                                         const ProblemDef& problem, std::vector<int>& open_stack);
+                                         const ProblemDef& problem, std::vector<int>& open_stack,
+                                         const std::vector<int>* blocking_fact_tokens = nullptr);
 
 public:
     CPORSolver() {

@@ -523,6 +523,30 @@ def run_my_grounder_and_solve(problem, use_cpor_loop: bool = True):
 
         action_id = native_api.get_chosen_action(node_idx)
         if action_id == -1:
+            # chosen_action_id defaults to -1 on the C++ side for two
+            # distinct conditions: a genuinely failed branch, or a solved
+            # leaf that needed no further action (goal already reached at
+            # this belief -- e.g. a sensing branch whose outcome, combined
+            # with OneOf/provenance deductions, immediately satisfies the
+            # goal). solve_cpor_loop's AND-node rule (close_node_and_propagate)
+            # requires BOTH children of a sensing node to be solved before
+            # the parent is ever marked solved, so every node reachable from
+            # an overall-solved root should be solved too -- reaching an
+            # unsolved node here would mean that invariant broke elsewhere
+            # in the solver. Surface that loudly instead of silently
+            # returning an incomplete/wrong tree.
+            assert native_api.get_node_is_solved(node_idx), (
+                f"extract_node reached an unsolved node (idx={node_idx}) while "
+                "extracting an overall-solved plan tree -- this should be "
+                "impossible given solve_cpor_loop's AND-node solving invariant."
+            )
+            # A solved leaf needing no further action: ContingentPlanNode has
+            # no way to represent "no action, just stop" (every node requires
+            # an action_instance), so this observation branch legitimately
+            # gets no child here -- the goal is already satisfied once the
+            # parent sensing action's outcome is observed. Callers walking
+            # the tree must check goal-reachedness before assuming every
+            # observation needs a matching branch.
             return None
 
         action_instance = converter.action_id_to_up_action[action_id]

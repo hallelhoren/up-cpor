@@ -55,7 +55,30 @@ public:
     // use this to attempt a sensing resolution instead of assuming no plan
     // was possible: an action truncated here isn't necessarily inapplicable,
     // it may just be blocked on a fact this belief hasn't resolved yet.
-    static std::vector<int> compute_linear_plan(const BeliefState& current_belief, const ProblemDef& problem, int sample_size, int* out_blocking_action_id = nullptr);
+    //
+    // out_blocking_fact_tokens (if non-null) covers the gap out_blocking_action_id
+    // can't: when FFSolver::search itself returns nothing for the primary
+    // guide witness (step 3), there's no specific action to blame, so
+    // out_blocking_action_id stays at -1 -- previously leaving the caller
+    // with no signal at all and forcing a full exhaustive-search fallback
+    // even when the real issue is a single still-unresolved fact a sensing
+    // action could clear up (e.g. a domain where establishing a package's
+    // own location is a prerequisite for reasoning about it at all, but
+    // isn't itself part of the goal formula, so it wouldn't be found by
+    // scanning the goal alone). Filled with candidate predicate-id tokens to
+    // try resolving via sensing, cleared/left empty if nothing looks
+    // promising: first the tokens of the goal formula that are still unknown
+    // in the real belief (the cheap, common case -- mirrors the reasoning
+    // that already existed for 4A/4C's blocking_action_id), then, only if
+    // that comes up empty, every predicate id the belief hasn't resolved yet
+    // at all. The guide witness concretized all of them via sampling, so FF
+    // had no *reason* to fail on that fully-determined copy of the problem
+    // unless it's genuinely unreachable there -- an unresolved fact
+    // elsewhere in the real belief is the next most likely explanation, and
+    // the only one this planner has enough information to act on.
+    static std::vector<int> compute_linear_plan(const BeliefState& current_belief, const ProblemDef& problem, int sample_size,
+                                                  int* out_blocking_action_id = nullptr,
+                                                  std::vector<int>* out_blocking_fact_tokens = nullptr);
 
     // Phase 1: Deliberation and Execution Dispatch
     int get_next_action();

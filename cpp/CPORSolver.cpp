@@ -56,8 +56,14 @@ void CPORSolver::expand_sensing_node(int node_idx, int action_id, int observe_fl
     // 1. Create TRUE Universe
     PartiallySpecifiedState true_state = current_state;
     true_state.set_known_value(observe_fluent, true);
+    // Scoped Regression Fix: this is a genuine observation, so abduce any
+    // conditional-effect conditions this now-known fact can resolve
+    // backward (see State.hpp's apply_provenance_deductions), then let
+    // that feed the existing OneOf closure and vice versa.
+    true_state.apply_provenance_deductions();
     apply_oneof_deductions(true_state);
-    
+    true_state.apply_provenance_deductions();
+
     int t_idx = static_cast<int>(node_pool.size());
     node_pool.emplace_back(true_state, action_id);
     node_pool[t_idx].parent_idx = node_idx;
@@ -65,7 +71,9 @@ void CPORSolver::expand_sensing_node(int node_idx, int action_id, int observe_fl
     // 2. Create FALSE Universe
     PartiallySpecifiedState false_state = current_state;
     false_state.set_known_value(observe_fluent, false);
+    false_state.apply_provenance_deductions();
     apply_oneof_deductions(false_state);
+    false_state.apply_provenance_deductions();
     
     int f_idx = static_cast<int>(node_pool.size());
     node_pool.emplace_back(false_state, action_id);
@@ -373,6 +381,69 @@ int CPORSolver::find_resolving_sensing_action(const std::vector<int>& blocked_pr
     return -1;
 }
 
+int CPORSolver::find_resolving_sensing_action_via_prefix(const std::vector<int>& blocked_precondition_rpn,
+                                                           const PartiallySpecifiedState& belief,
+                                                           std::vector<int>& out_prefix_actions) {
+    // Depth 0: the cheap, common case (doors/wumpus/ebtcs-shaped domains,
+    // where the resolving sensing action is already applicable right now).
+    int direct = find_resolving_sensing_action(blocked_precondition_rpn, belief);
+    if (direct != -1) return direct;
+
+    const ProblemDef& problem = get_global_problem();
+
+    struct SearchState {
+        PartiallySpecifiedState belief;
+        std::vector<int> prefix;
+    };
+
+    std::vector<SearchState> frontier;
+    frontier.push_back({belief, {}});
+    std::unordered_set<PartiallySpecifiedState, StateHasher> visited;
+    visited.insert(belief);
+
+    // Total visited-state budget across the whole search, independent of the
+    // depth cap: guards against a domain with a very large per-step branching
+    // factor still blowing up within MAX_SENSING_PREFIX_DEPTH levels. This is
+    // meant to stay cheap and non-exhaustive -- if the budget runs out, the
+    // caller falls back to solve_from_node exactly as before this method
+    // existed, so running out here never sacrifices correctness, only misses
+    // a potential shortcut.
+    constexpr size_t MAX_VISITED_STATES = 2000;
+
+    for (int depth = 0; depth < MAX_SENSING_PREFIX_DEPTH && !frontier.empty(); ++depth) {
+        std::vector<SearchState> next_frontier;
+        for (const auto& node : frontier) {
+            for (const auto& action : problem.actions) {
+                // Only chain through classical actions: a sensing action here
+                // would itself branch on an unknown outcome, which this
+                // simple linear-prefix search doesn't attempt to reason
+                // about (that's what the AND-node machinery in solve_from_node
+                // and solve_cpor_loop's own partial-plan execution already do).
+                if (action.observe_predicate_id != -1) continue;
+                if (!is_action_applicable(action, node.belief)) continue;
+
+                PartiallySpecifiedState next_belief = node.belief;
+                ActionApplier::apply_action(action, next_belief);
+                if (visited.count(next_belief)) continue;
+                if (visited.size() >= MAX_VISITED_STATES) return -1;
+                visited.insert(next_belief);
+
+                std::vector<int> next_prefix = node.prefix;
+                next_prefix.push_back(action.id);
+
+                int resolver = find_resolving_sensing_action(blocked_precondition_rpn, next_belief);
+                if (resolver != -1) {
+                    out_prefix_actions = std::move(next_prefix);
+                    return resolver;
+                }
+                next_frontier.push_back({std::move(next_belief), std::move(next_prefix)});
+            }
+        }
+        frontier = std::move(next_frontier);
+    }
+    return -1;
+}
+
 bool CPORSolver::fallback_to_exhaustive_search(int node_idx) {
     ++fallback_invocation_count;
     std::vector<int> path;
@@ -475,18 +546,46 @@ void CPORSolver::close_node_and_propagate(int node_idx) {
 }
 
 bool CPORSolver::try_resolve_via_sensing_branch(int cursor_idx, int blocking_action_id, const PartiallySpecifiedState& belief,
-                                                 const ProblemDef& problem, std::vector<int>& open_stack) {
-    if (blocking_action_id == -1) return false;
+                                                 const ProblemDef& problem, std::vector<int>& open_stack,
+                                                 const std::vector<int>* blocking_fact_tokens) {
+    std::vector<int> prefix_actions;
+    int resolver = -1;
 
-    const GroundedAction& blocked_action = problem.actions[blocking_action_id];
-    int resolver = find_resolving_sensing_action(blocked_action.precondition_rpn, belief);
+    if (blocking_action_id != -1) {
+        const GroundedAction& blocked_action = problem.actions[blocking_action_id];
+        resolver = find_resolving_sensing_action_via_prefix(blocked_action.precondition_rpn, belief, prefix_actions);
+    }
+    if (resolver == -1 && blocking_fact_tokens != nullptr && !blocking_fact_tokens->empty()) {
+        resolver = find_resolving_sensing_action_via_prefix(*blocking_fact_tokens, belief, prefix_actions);
+    }
     if (resolver == -1) return false;
 
+    // Materialize any navigate-then-sense prefix as an ordinary chain of
+    // classical (OR) nodes, exactly like solve_cpor_loop's own partial-plan
+    // execution does -- empty when the resolver was already applicable
+    // directly at `belief` (the pre-existing, common case). node_pool is a
+    // std::vector, so each emplace_back below can reallocate and invalidate
+    // any reference into it; chain_cursor/child_idx are plain indices and
+    // chain_belief is a by-value copy, so nothing here holds a stale
+    // reference across that call (see solve_from_node's identical caution).
+    int chain_cursor = cursor_idx;
+    PartiallySpecifiedState chain_belief = belief;
+    for (int action_id : prefix_actions) {
+        const GroundedAction& action = problem.actions[action_id];
+        ActionApplier::apply_action(action, chain_belief);
+        int child_idx = static_cast<int>(node_pool.size());
+        node_pool.emplace_back(chain_belief, action.id);
+        node_pool[child_idx].parent_idx = chain_cursor;
+        node_pool[chain_cursor].single_child_idx = child_idx;
+        node_pool[chain_cursor].chosen_action_id = action.id;
+        chain_cursor = child_idx;
+    }
+
     const GroundedAction& sense_action = problem.actions[resolver];
-    expand_sensing_node(cursor_idx, resolver, sense_action.observe_predicate_id, belief);
-    node_pool[cursor_idx].chosen_action_id = resolver;
-    open_stack.push_back(node_pool[cursor_idx].false_child_idx);
-    open_stack.push_back(node_pool[cursor_idx].true_child_idx);
+    expand_sensing_node(chain_cursor, resolver, sense_action.observe_predicate_id, chain_belief);
+    node_pool[chain_cursor].chosen_action_id = resolver;
+    open_stack.push_back(node_pool[chain_cursor].false_child_idx);
+    open_stack.push_back(node_pool[chain_cursor].true_child_idx);
     return true;
 }
 
@@ -502,6 +601,21 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
         if (node_pool[node_idx].is_solved || node_pool[node_idx].is_failed) {
             continue; // Already resolved, e.g. via close_node_and_propagate.
         }
+
+        // fallback_to_exhaustive_search's own std::bad_alloc guard only covers
+        // its direct solve_from_node call -- node_pool's already-allocated
+        // capacity never shrinks just because that catch fired, so sustained
+        // memory pressure from an earlier fallback can still make a LATER,
+        // completely unrelated node_pool.emplace_back below (e.g. materializing
+        // a navigate-then-sense prefix chain, or an ordinary classical-action
+        // child) throw std::bad_alloc with nothing above it to catch it,
+        // crossing the extern "C"/ctypes boundary uncaught and crashing the
+        // whole host process exactly like the original, narrower gap this
+        // mirrors (see fallback_to_exhaustive_search's own comment). Degrade
+        // the same way: treat this node as failed and let the caller's
+        // eventual fallback attempt (if any) try again once some of the
+        // arena's failed subtree work has been abandoned.
+        try {
 
         // Copy the belief before any node_pool-mutating call below: node_pool
         // is a std::vector, and emplace_back may reallocate, invalidating any
@@ -541,15 +655,18 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
         // action.
         BeliefState wrapped_belief(node_belief);
         int blocking_action_id = -1;
-        std::vector<int> partial_plan = SDRPlanner::compute_linear_plan(wrapped_belief, problem, CPOR_LOOP_WITNESS_SAMPLE_COUNT, &blocking_action_id);
+        std::vector<int> blocking_fact_tokens;
+        std::vector<int> partial_plan = SDRPlanner::compute_linear_plan(wrapped_belief, problem, CPOR_LOOP_WITNESS_SAMPLE_COUNT, &blocking_action_id, &blocking_fact_tokens);
 
         if (partial_plan.empty()) {
             // compute_linear_plan may have truncated to nothing because its
             // very first candidate action was blocked on a fact this belief
-            // hasn't resolved yet (blocking_action_id != -1), not because no
-            // plan exists at all -- try sensing that fact before assuming the
-            // online loop is stuck.
-            if (!try_resolve_via_sensing_branch(node_idx, blocking_action_id, node_belief, problem, open_stack)) {
+            // hasn't resolved yet (blocking_action_id != -1), or because
+            // FFSolver::search itself found nothing for the guide witness
+            // (blocking_action_id == -1, blocking_fact_tokens covers this
+            // case instead) -- not because no plan exists at all. Try
+            // sensing before assuming the online loop is stuck.
+            if (!try_resolve_via_sensing_branch(node_idx, blocking_action_id, node_belief, problem, open_stack, &blocking_fact_tokens)) {
                 fallback_to_exhaustive_search(node_idx);
             }
             continue;
@@ -614,22 +731,71 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
         if (!branched) {
             // Ran off the end of partial_plan without hitting a sensing
             // branch -- per OnlinePlan's own contract this should mean the
-            // goal now holds. Verified rather than assumed: if it doesn't
-            // (most commonly because compute_linear_plan truncated the tail
-            // of its own candidate_plan on a witness-blocked action --
-            // blocking_action_id names it -- rather than the plan ending
-            // cleanly), try resolving that blocked action via sensing before
-            // falling back and discarding the safe prefix already executed.
+            // goal now holds. Verified rather than assumed: if it doesn't,
+            // there are three possible reasons, cheapest-to-check first:
+            //  1. compute_linear_plan truncated the tail of its own
+            //     candidate_plan on a witness-blocked action -- blocking_action_id
+            //     names it.
+            //  2. FFSolver::search found nothing at all for the guide
+            //     witness -- blocking_fact_tokens (from that same, now-stale
+            //     top-of-loop compute_linear_plan call) names candidates.
+            //  3. Neither of the above: candidate_plan was non-empty and
+            //     passed 4A/4C's multi-witness validation cleanly (every
+            //     sampled witness already agreed on it), yet still doesn't
+            //     establish the actual goal against the REAL belief -- e.g.
+            //     the goal references a fact that happened to already hold
+            //     in every sampled witness by chance, so no action in the
+            //     plan was ever needed (or chosen) to establish it, even
+            //     though it's still genuinely unknown here. blocking_action_id
+            //     and the stale blocking_fact_tokens both miss this case (it
+            //     never truncated anything), so re-scan the goal directly
+            //     against cursor_belief -- the actual belief at this point,
+            //     not the one compute_linear_plan reasoned about before any
+            //     of partial_plan executed.
             if (Evaluator::evaluate(problem.goal_rpn, cursor_belief, EvalMode::PESSIMISTIC)) {
                 node_pool[cursor_idx].is_solved = true;
                 solved_cache[cursor_belief] = cursor_idx;
                 close_node_and_propagate(cursor_idx);
-            } else if (!try_resolve_via_sensing_branch(cursor_idx, blocking_action_id, cursor_belief, problem, open_stack)) {
-                fallback_to_exhaustive_search(node_idx);
+            } else {
+                std::vector<int> goal_blocking_tokens;
+                for (int token : problem.goal_rpn) {
+                    if (token >= 0 && cursor_belief.is_unknown(token)) {
+                        goal_blocking_tokens.push_back(token);
+                    }
+                }
+                if (goal_blocking_tokens.empty()) {
+                    // The goal formula itself doesn't mention any currently-unknown
+                    // fact -- the block is one step removed (e.g. the chosen
+                    // plan's own object bindings only make sense for whichever
+                    // witness FF happened to be guided by, so the goal was
+                    // technically reachable *for that witness* without ever
+                    // resolving some other, non-goal fact this belief still
+                    // doesn't know). Fall back to every unresolved fact in the
+                    // real belief, exactly like compute_linear_plan's own
+                    // candidate_plan.empty() fallback (see its comment).
+                    for (int pred_id = 0; pred_id < problem.total_predicates; ++pred_id) {
+                        if (cursor_belief.is_unknown(pred_id)) {
+                            goal_blocking_tokens.push_back(pred_id);
+                        }
+                    }
+                }
+                const std::vector<int>* tokens_to_try = !goal_blocking_tokens.empty() ? &goal_blocking_tokens : &blocking_fact_tokens;
+                if (!try_resolve_via_sensing_branch(cursor_idx, blocking_action_id, cursor_belief, problem, open_stack, tokens_to_try)) {
+                    fallback_to_exhaustive_search(node_idx);
+                }
             }
         }
         // If branched, the two new children are already on open_stack and
         // will eventually resolve node_idx via close_node_and_propagate.
+        } catch (const std::bad_alloc&) {
+            // See the comment where this try begins. Not inserted into
+            // failed_cache: running out of memory proves nothing about
+            // node_idx's true solvability, only that this attempt couldn't
+            // finish (same reasoning as fallback_to_exhaustive_search's own
+            // catch).
+            node_pool[node_idx].is_failed = true;
+            close_node_and_propagate(node_idx);
+        }
     }
 
     return node_pool[root_idx].is_solved;

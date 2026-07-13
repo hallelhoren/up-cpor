@@ -273,11 +273,74 @@ extern "C" {
     int get_cpor_loop_fallback_count() {
         return global_solver ? global_solver->get_fallback_invocation_count() : -1;
     }
+
+    // =====================================================================
+    // SDR INCREMENTAL SESSION API (native backing for up_cpor.engine.SDRImpl's
+    // ActionSelectorMixin interface: get_action()/update(observation) one
+    // step at a time, as opposed to solve_native()/solve_native_cpor_loop()'s
+    // batch "build the whole plan tree" contract above). Global, single-session
+    // state, matching global_solver's own convention -- this engine is used
+    // synchronously from a single UP ActionSelector at a time, never
+    // concurrently, exactly like the batch entry points already assume.
+    // =====================================================================
+    CPOR::SDRPlanner* global_sdr_session = nullptr;
+
+    void sdr_session_init() {
+        if (global_sdr_session) delete global_sdr_session;
+
+        PartiallySpecifiedState initial_state = build_owa_initial_state();
+
+        bool ff_ready = CPOR::FFBridge::build(get_global_problem());
+        std::cout << "[FF] Relaxed-planning-graph heuristic "
+                  << (ff_ready ? "available for this problem." : "not usable for this problem (falling back to bounded BFS heuristic).")
+                  << std::endl;
+
+        global_sdr_session = new CPOR::SDRPlanner(initial_state, get_global_problem());
+    }
+
+    // Returns the next action id to execute, -1 if the goal is already
+    // reached, or -2 on failure (confirmed dead end, classical solver found
+    // no plan, or the session state machine was used out of order -- e.g.
+    // calling this again before sdr_apply_observation() answered a pending
+    // sensing action). Mirrors CPOR::SDRPlanner::get_next_action()'s own
+    // return contract directly.
+    int sdr_get_next_action() {
+        if (!global_sdr_session) return -2;
+        return global_sdr_session->get_next_action();
+    }
+
+    // Answers the sensing action most recently returned by
+    // sdr_get_next_action(); observation_value is the sensed truth value of
+    // that action's observed fluent. Returns false if the session wasn't
+    // actually expecting an observation, or if the observation contradicts
+    // the problem's oneof invariants.
+    bool sdr_apply_observation(bool observation_value) {
+        if (!global_sdr_session) return false;
+        return global_sdr_session->apply_observation(observation_value);
+    }
+
+    void sdr_session_destroy() {
+        if (global_sdr_session) {
+            delete global_sdr_session;
+            global_sdr_session = nullptr;
+        }
+    }
     // =====================================================================
     // PLAN EXTRACTION GETTERS FOR PYTHON
     // =====================================================================
-    int get_chosen_action(int node_idx) { 
-        return global_solver->get_node(node_idx).chosen_action_id; 
+    int get_chosen_action(int node_idx) {
+        return global_solver->get_node(node_idx).chosen_action_id;
+    }
+
+    // Distinguishes a genuinely failed node from a solved leaf that needed
+    // no further action (goal already reached at this belief -- e.g. a
+    // sensing branch whose outcome, combined with OneOf/provenance
+    // deductions, immediately satisfies the goal). Both cases leave
+    // chosen_action_id at its default -1, so callers extracting the plan
+    // tree must check this explicitly rather than inferring "failed" from
+    // get_chosen_action() == -1 alone.
+    int get_node_is_solved(int node_idx) {
+        return global_solver->get_node(node_idx).is_solved ? 1 : 0;
     }
     
     int get_single_child(int node_idx) { 

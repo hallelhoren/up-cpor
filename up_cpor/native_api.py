@@ -74,8 +74,18 @@ cpor_lib.solve_native_cpor_loop.argtypes = []
 cpor_lib.solve_native_cpor_loop.restype = ctypes.c_bool
 cpor_lib.get_cpor_loop_fallback_count.argtypes = []
 cpor_lib.get_cpor_loop_fallback_count.restype = ctypes.c_int
+cpor_lib.sdr_session_init.argtypes = []
+cpor_lib.sdr_session_init.restype = None
+cpor_lib.sdr_get_next_action.argtypes = []
+cpor_lib.sdr_get_next_action.restype = ctypes.c_int
+cpor_lib.sdr_apply_observation.argtypes = [ctypes.c_bool]
+cpor_lib.sdr_apply_observation.restype = ctypes.c_bool
+cpor_lib.sdr_session_destroy.argtypes = []
+cpor_lib.sdr_session_destroy.restype = None
 cpor_lib.get_chosen_action.argtypes = [ctypes.c_int]
 cpor_lib.get_chosen_action.restype = ctypes.c_int
+cpor_lib.get_node_is_solved.argtypes = [ctypes.c_int]
+cpor_lib.get_node_is_solved.restype = ctypes.c_int
 cpor_lib.get_single_child.argtypes = [ctypes.c_int]
 cpor_lib.get_single_child.restype = ctypes.c_int
 cpor_lib.get_true_child.argtypes = [ctypes.c_int]
@@ -193,8 +203,40 @@ def get_cpor_loop_fallback_count() -> int:
     Only meaningful immediately after a solve_native_cpor_loop() call."""
     return cpor_lib.get_cpor_loop_fallback_count()
 
+def sdr_session_init() -> None:
+    """Starts a fresh incremental SDR session over the problem most recently
+    loaded via load_problem_to_cpp -- the native backing for
+    up_cpor.engine.SDRImpl's ActionSelectorMixin (get_action()/update()),
+    as opposed to solve_native()/solve_native_cpor_loop()'s batch "build the
+    whole plan tree up front" contract."""
+    cpor_lib.sdr_session_init()
+
+def sdr_get_next_action() -> int:
+    """Returns the next action id to execute, -1 if the goal is already
+    reached, or -2 on failure (confirmed dead end, classical solver found no
+    plan, or the session was used out of order)."""
+    return cpor_lib.sdr_get_next_action()
+
+def sdr_apply_observation(value: bool) -> bool:
+    """Answers the sensing action most recently returned by
+    sdr_get_next_action() with its observed truth value. Returns False if no
+    observation was actually pending, or if it contradicts the problem's
+    oneof invariants."""
+    return bool(cpor_lib.sdr_apply_observation(value))
+
+def sdr_session_destroy() -> None:
+    cpor_lib.sdr_session_destroy()
+
 def get_chosen_action(node_idx: int) -> int:
     return cpor_lib.get_chosen_action(node_idx)
+
+def get_node_is_solved(node_idx: int) -> bool:
+    """True for both a node with a chosen action AND a solved leaf that
+    needed no further action (goal already reached at this belief). Callers
+    extracting the plan tree must check this instead of inferring "failed"
+    from get_chosen_action(node_idx) == -1 alone -- both a failed node and a
+    no-action-needed solved leaf leave chosen_action_id at its default -1."""
+    return bool(cpor_lib.get_node_is_solved(node_idx))
 
 def get_single_child(node_idx: int) -> int:
     return cpor_lib.get_single_child(node_idx)

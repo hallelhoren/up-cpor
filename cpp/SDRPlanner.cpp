@@ -70,9 +70,41 @@ bool SDRPlanner::verify_contingent_deadends(const PartiallySpecifiedState& state
 
 std::vector<int> SDRPlanner::get_plan_from_solver(const PartiallySpecifiedState& state) const {
     // This acts as the deliberation phase, querying the classical planner.
-    // It delegates the heavy lifting to the BFSSolver which treats the 
-    // PartiallySpecifiedState as a determinized root node.
-    return BFSSolver::solve(state, global_problem);
+    // Both FFSolver::search and BFSSolver::solve require a FULLY
+    // DETERMINIZED state -- `state` (belief.get_current_state()) generally
+    // isn't one: under this engine's open-world initialization, any fact
+    // not yet resolved by an action/observation is genuinely UNKNOWN, not
+    // arbitrarily true or false, so passing it directly leaves every
+    // precondition referencing an unresolved fact evaluating false and the
+    // classical search degenerately inapplicable from the very first step
+    // (this was a real, latent bug: it made this instance-based
+    // get_next_action() path fail outright on any domain with real initial
+    // uncertainty, e.g. doors5, until this fix -- previously masked because
+    // nothing exercised this path before it was wired up to
+    // up_cpor.engine.SDRImpl).
+    //
+    // SDRPlanner::compute_linear_plan (the CPOR outer loop's stateless
+    // OnlinePlan subroutine) avoids this by sampling a concrete witness via
+    // SDRSampler before ever calling FFSolver::search; do the same single-
+    // witness determinization here, matching the SDR paper's own Algorithm
+    // 1/2 "sample a distinguished state, plan for it, execute until an
+    // observation contradicts it" model. Note this is deliberately the
+    // simpler, single-witness SDR model -- it does not carry
+    // compute_linear_plan's own additional multi-witness safety validation
+    // (4A/4B/4C in SDRPlanner::compute_linear_plan), since that machinery
+    // is specific to CPOR's stack-based tree-building loop, not to SDR's
+    // own one-action-at-a-time online replanning contract.
+    std::vector<PartiallySpecifiedState> witnesses = SDRSampler::sample_concrete_states(state, global_problem, 1);
+    if (witnesses.empty()) {
+        return {};
+    }
+    const PartiallySpecifiedState& witness = witnesses[0];
+
+    std::vector<int> plan = FFSolver::search(witness, global_problem);
+    if (!plan.empty()) {
+        return plan;
+    }
+    return BFSSolver::solve(witness, global_problem);
 }
 
 int SDRPlanner::get_next_action() {
@@ -99,23 +131,72 @@ int SDRPlanner::get_next_action() {
         return -2; // Confirmed failure
     }
 
-    // 3. Plan Retrieval / Generation
+    // 3. Plan Retrieval / Generation, with real-belief precondition
+    // re-validation before ever proposing an action to the caller -- SDR
+    // Algorithm 2's own safety check (regress the negation of the next
+    // action's precondition through history; if inconsistent with the real
+    // belief, abandon the plan and replan -- see SDRPlanner::compute_linear_plan's
+    // step 4A for the same idea applied to CPOR's tree-building loop). The
+    // plan in plan_queue was derived from a single SAMPLED witness (see
+    // get_plan_from_solver), so its next step might depend on a fact that
+    // witness merely guessed rather than one this belief actually knows.
+    // Previously unchecked here: the caller could be handed an action that
+    // was never actually applicable in the real state, only in the witness
+    // that happened to produce it.
     int action_to_execute = -1;
-    
-    // If we have exhausted our current plan trajectory, we must replan
-    if (next_action_index >= plan_queue.size()) {
-        plan_queue = get_plan_from_solver(current_state);
-        
-        if (plan_queue.empty()) {
-            std::cerr << "CRITICAL: Classical solver failed to find a path from the current belief state." << std::endl;
-            return -2; // Execution failure
+
+    constexpr int MAX_REPLAN_ATTEMPTS = 5;
+    for (int attempt = 0; attempt < MAX_REPLAN_ATTEMPTS; ++attempt) {
+        if (next_action_index >= plan_queue.size()) {
+            plan_queue = get_plan_from_solver(current_state);
+
+            if (plan_queue.empty()) {
+                std::cerr << "CRITICAL: Classical solver failed to find a path from the current belief state." << std::endl;
+                return -2; // Execution failure
+            }
+
+            next_action_index = 0;
         }
-        
-        // Reset execution pointer for the new plan
-        next_action_index = 0; 
+
+        int candidate = plan_queue[next_action_index];
+        if (Evaluator::evaluate(global_problem.actions[candidate].precondition_rpn, current_state, EvalMode::PESSIMISTIC)) {
+            action_to_execute = candidate;
+            break;
+        }
+
+        // This witness-derived plan's next step isn't actually known-applicable
+        // against the real belief -- discard it and force a fresh sample +
+        // classical-solve attempt on the next loop iteration.
+        plan_queue.clear();
+        next_action_index = 0;
     }
 
-    action_to_execute = plan_queue[next_action_index];
+    if (action_to_execute == -1) {
+        // Repeated resampling didn't help -- likely a structural gap rather
+        // than an unlucky witness: FF has no incentive to ever choose a
+        // sensing action when handed a single fully-determined witness
+        // (every fact already has *some* value by construction), so if the
+        // domain requires sensing before it's possible to know a
+        // precondition at all (e.g. colorballs2-2: you must sense a ball's
+        // color before any trash-it action's precondition is knowable),
+        // every fresh witness reproduces the identical class of failure.
+        // find_loop_breaking_sensing_action is already used for exactly
+        // this "actively force an epistemic collapse" purpose during cycle
+        // breaking below; reuse it as a general last resort here too.
+        int sensing_action = find_loop_breaking_sensing_action(current_state);
+        if (sensing_action != -1) {
+            plan_queue = { sensing_action };
+            next_action_index = 0;
+            action_to_execute = sensing_action;
+        }
+    }
+
+    if (action_to_execute == -1) {
+        std::cerr << "CRITICAL: Repeated replanning (" << MAX_REPLAN_ATTEMPTS
+                  << " attempts) could not find an action whose precondition is "
+                  << "known-true against the real belief." << std::endl;
+        return -2;
+    }
 
     // 4. Physical Cycle Detection & SDR Loop Breaking
     // Predict the immediate physical result of this action using our stateless applier.
@@ -152,6 +233,16 @@ int SDRPlanner::get_next_action() {
     // Lock the planner if this action requires environmental feedback
     if (global_problem.actions[action_to_execute].observe_predicate_id != -1) {
         expecting_observation = true;
+        // apply_observation() requires this to be set (it looks up which
+        // fluent was being sensed via global_problem.actions[pending_sensing_action_id]) --
+        // previously left at its constructor default of -1 forever, so
+        // apply_observation() always hit its own "not currently expecting
+        // one" guard and failed on every call, regardless of expecting_observation
+        // above being correctly true. Latent since nothing exercised this
+        // instance-based get_next_action()/apply_observation() step-by-step
+        // path until now (compute_linear_plan's stateless usage never
+        // touches it).
+        pending_sensing_action_id = action_to_execute;
     }
 
     return action_to_execute;
@@ -184,10 +275,19 @@ bool SDRPlanner::apply_observation(bool observation_value) {
     // This transitions the specific fluent from VAL_UNKNOWN to VAL_TRUE/VAL_FALSE.
     updated_state.set_known_value(sensing_action.observe_predicate_id, observation_value);
 
+    // 2b. Scoped Regression Fix: this is a genuine observation, so abduce
+    // any conditional-effect conditions this now-known fact can resolve
+    // backward (see State.hpp's apply_provenance_deductions) before the
+    // OneOf closure below -- and once more after, in case OneOf deductions
+    // themselves resolved a fact another pending provenance was waiting on.
+    updated_state.apply_provenance_deductions();
+
     // 3. Epistemic Collapse (OneOf Deductions)
-    // Now that a new concrete fact is known, propagate this knowledge across all 
+    // Now that a new concrete fact is known, propagate this knowledge across all
     // mutually exclusive (OneOf) groups to deduce hidden variables and collapse the belief space.
     bool is_logically_valid = updated_state.apply_oneof_deductions(global_problem.oneofs);
+
+    updated_state.apply_provenance_deductions();
 
     if (!is_logically_valid) {
         std::cerr << "FATAL ERROR: The physical observation (" << observation_value 
@@ -219,9 +319,11 @@ std::vector<int> SDRPlanner::compute_linear_plan(
     const BeliefState& current_belief,
     const ProblemDef& problem,
     int sample_size,
-    int* out_blocking_action_id)
+    int* out_blocking_action_id,
+    std::vector<int>* out_blocking_fact_tokens)
 {
     if (out_blocking_action_id) *out_blocking_action_id = -1;
+    if (out_blocking_fact_tokens) out_blocking_fact_tokens->clear();
 
     // 1. Determinization: Sample diverse concrete "witness" states
     std::vector<PartiallySpecifiedState> sampled_states =
@@ -238,6 +340,29 @@ std::vector<int> SDRPlanner::compute_linear_plan(
     std::vector<int> candidate_plan = FFSolver::search(primary_guide_state, problem);
 
     if (candidate_plan.empty()) {
+        // FF found nothing at all for the primary guide witness -- there's no
+        // specific action to blame (out_blocking_action_id stays -1), but
+        // the caller can still often make progress: surface which of the
+        // REAL belief's still-unresolved facts is most likely responsible,
+        // so it can try a sensing branch instead of falling straight back to
+        // the exhaustive search. See this method's header comment for why
+        // goal tokens are tried first and a full unresolved-fact sweep only
+        // as the fallback.
+        if (out_blocking_fact_tokens) {
+            const PartiallySpecifiedState& real_belief = current_belief.get_current_state();
+            for (int token : problem.goal_rpn) {
+                if (token >= 0 && real_belief.is_unknown(token)) {
+                    out_blocking_fact_tokens->push_back(token);
+                }
+            }
+            if (out_blocking_fact_tokens->empty()) {
+                for (int pred_id = 0; pred_id < problem.total_predicates; ++pred_id) {
+                    if (real_belief.is_unknown(pred_id)) {
+                        out_blocking_fact_tokens->push_back(pred_id);
+                    }
+                }
+            }
+        }
         return {}; // No classical path found
     }
 
