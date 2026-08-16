@@ -2,17 +2,36 @@ from __future__ import annotations
 
 import os
 import sys
-import clr
-import System
-if sys.platform.startswith('win'):
-    # use the .NET Framework runtime
-    System.Environment.SetEnvironmentVariable("COMPLUS_Version", "v4.0.30319")
-else:
-    # use Mono or .NET Core depending on the platform
-    if sys.platform.startswith('linux') or sys.platform.startswith('darwin'):
-        System.Environment.SetEnvironmentVariable("MONO_ENV_OPTIONS", "--debug")
-    elif sys.platform.startswith('openbsd') or sys.platform.startswith('freebsd'):
-        System.Environment.SetEnvironmentVariable("DOTNET_ROOT", "/usr/local/share/dotnet")
+
+# pythonnet requires a working CLR runtime (Mono on Linux/macOS, .NET
+# Framework/Core on Windows) to even import -- on a system where that runtime
+# is missing or misconfigured, `import clr` itself raises (empirically,
+# clr_loader surfaces this as RuntimeError, not ImportError, so it is not
+# caught by the narrower `except ImportError` already used below for the
+# CPORLib.dll load). This module's legacy C# CPORLib bridge is optional --
+# up_cpor.engine's CPORImpl/SDRImpl route through the native C++ core and
+# never import this module -- so a missing runtime here must not prevent
+# importing up_cpor.converter itself, only using its C#-backed
+# functionality, exactly like the CPORLib.dll fallback immediately below.
+try:
+    import clr
+    import System
+    if sys.platform.startswith('win'):
+        # use the .NET Framework runtime
+        System.Environment.SetEnvironmentVariable("COMPLUS_Version", "v4.0.30319")
+    else:
+        # use Mono or .NET Core depending on the platform
+        if sys.platform.startswith('linux') or sys.platform.startswith('darwin'):
+            System.Environment.SetEnvironmentVariable("MONO_ENV_OPTIONS", "--debug")
+        elif sys.platform.startswith('openbsd') or sys.platform.startswith('freebsd'):
+            System.Environment.SetEnvironmentVariable("DOTNET_ROOT", "/usr/local/share/dotnet")
+    clr_runtime_available = True
+except Exception as clr_runtime_error:
+    clr = None
+    System = None
+    clr_runtime_available = False
+    print(f"WARNING: pythonnet CLR runtime unavailable ({clr_runtime_error}). Legacy C# engine is disabled.")
+    print("-> C++ POC components and pure Python modules will continue to work.")
 
 PROJECT_PATH = os.path.dirname(os.path.abspath(__file__))
 
@@ -24,14 +43,15 @@ possible_dll_paths = [
 ]
 
 dll_loaded = False
-for p in possible_dll_paths:
-    if os.path.exists(p):
-        clr.AddReference(p)
-        dll_loaded = True
-        break
+if clr_runtime_available:
+    for p in possible_dll_paths:
+        if os.path.exists(p):
+            clr.AddReference(p)
+            dll_loaded = True
+            break
 
-if not dll_loaded:
-    print(f"WARNING: CPORLib.dll not found in any of the expected locations.")
+    if not dll_loaded:
+        print(f"WARNING: CPORLib.dll not found in any of the expected locations.")
 
 try:
     from CPORLib.PlanningModel import Domain, Problem, ParametrizedAction, PlanningAction, Simulator

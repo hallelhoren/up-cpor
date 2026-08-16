@@ -1,5 +1,5 @@
 import itertools
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import unified_planning as up
 from unified_planning.model import FNode, OperatorKind, Fluent
@@ -352,6 +352,19 @@ class UpCporConverter:
                     if rpn_list:
                         grounded_data['deadends'].append(rpn_list)
 
+        # 8. "Simple problem" flag for Plan Graph Compaction (Option B).
+        # Mirrors the legacy C# engine's Domain.IsSimple exactly: false the
+        # instant ANY action anywhere has ANY conditional effect (see
+        # CPORLib/PlanningModel/Domain.cs's AddAction). Gates CPORSolver's
+        # K(n)/H(n) belief-equivalence caching (native_bridge.cpp's
+        # set_problem_is_simple, called from native_api.load_problem_to_cpp) --
+        # applying that mechanism outside simple domains is a soundness
+        # hazard, not just a missed-optimization one (see CPORSolver.cpp's
+        # compute_and_register_relevance).
+        grounded_data['is_simple'] = not any(
+            act['conditional_effects'] for act in grounded_data['actions']
+        )
+
         # Trigger Native Serialization
         native_api.load_problem_to_cpp(grounded_data)
         native_api.print_problem_stats()
@@ -517,9 +530,30 @@ def run_my_grounder_and_solve(problem, use_cpor_loop: bool = True):
     substituter = Substituter(problem.environment)
     exp_manager = problem.environment.expression_manager
 
+    # Plan Graph Compaction (Option A): CPORSolver's solved_cache already makes
+    # multiple search-tree parents point at the same native node_idx whenever
+    # solve_from_node/solve_cpor_loop hits an exact belief-state repeat (see
+    # CPORSolver.cpp) -- but this extraction was a plain unmemoized recursive
+    # walk, so every parent independently rebuilt a brand-new ContingentPlanNode
+    # subtree for that shared node_idx, discarding the sharing the C++ layer
+    # already computed. node_memo makes a second (or third, ...) visit to the
+    # same node_idx return the SAME ContingentPlanNode object instead of
+    # rebuilding it, turning the exported plan back into the DAG the native
+    # solver already reasons over. Safe by construction: it only merges nodes
+    # the search itself already proved are the exact same reachable belief
+    # state (solved_cache's own equality, comparable_mask-masked) -- no new
+    # equivalence approximation is introduced here. ContingentPlanNode/
+    # ContingentPlan tolerate a node being referenced from multiple parents
+    # (plain list-of-children, no cycle-sensitive traversal), and CPOR/SDR
+    # plans are acyclic in belief space by construction, so this can't create
+    # a reference cycle.
+    node_memo: Dict[int, Optional[ContingentPlanNode]] = {}
+
     def extract_node(node_idx: int) -> ContingentPlanNode:
         if node_idx < 0:
             return None
+        if node_idx in node_memo:
+            return node_memo[node_idx]
 
         action_id = native_api.get_chosen_action(node_idx)
         if action_id == -1:
@@ -547,10 +581,16 @@ def run_my_grounder_and_solve(problem, use_cpor_loop: bool = True):
             # parent sensing action's outcome is observed. Callers walking
             # the tree must check goal-reachedness before assuming every
             # observation needs a matching branch.
+            node_memo[node_idx] = None
             return None
 
         action_instance = converter.action_id_to_up_action[action_id]
         node = ContingentPlanNode(action_instance)
+        # Registered before recursing into children: harmless since node_idx
+        # -> child node_idx edges are acyclic (see the comment above
+        # node_memo), but this is the standard, cheap-and-safe way to write a
+        # memoized DAG construction regardless.
+        node_memo[node_idx] = node
 
         true_idx = native_api.get_true_child(node_idx)
         false_idx = native_api.get_false_child(node_idx)
@@ -626,7 +666,7 @@ def extract_grounded_problem_data(problem):
     for i, action in enumerate(g_problem.actions):
         action_map[i] = ActionInstance(action)
         
-        # CORRECTED: Iterate over preconditions (since it is a list of FNodes)
+        # action.preconditions is a list of FNodes.
         pre_rpn = []
         for p_idx, p in enumerate(action.preconditions):
             pre_rpn.extend(compiler._compile_to_rpn(p))
@@ -647,7 +687,6 @@ def extract_grounded_problem_data(problem):
             'eff_vals': eff_vals
         })
         
-    # CORRECTED: Iterate over goals
     goal_rpn = []
     for g_idx, g in enumerate(g_problem.goals):
         goal_rpn.extend(compiler._compile_to_rpn(g))

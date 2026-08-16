@@ -41,7 +41,7 @@ public:
             uint8_t result = Evaluator::evaluate_rpn_raw(rpn, state);
             
             if (result == VAL_TRUE) {
-                dead_end_cache.insert(state); // Cache the fatal result
+                dead_end_cache.insert(state);
                 return DeadEndStatus::FATAL;
             } else if (result == VAL_UNKNOWN) {
                 maybe_dead_end = true; // We can't guarantee safety yet

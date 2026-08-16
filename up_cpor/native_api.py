@@ -26,6 +26,8 @@ cpor_lib = ctypes.CDLL(_LIB_PATH)
 # Define Strict ctypes Signatures (ABI Security)
 # ---------------------------------------------------------
 cpor_lib.init_problem.argtypes = [ctypes.c_int, ctypes.c_int]
+cpor_lib.set_problem_is_simple.argtypes = [ctypes.c_bool]
+cpor_lib.set_problem_is_simple.restype = None
 cpor_lib.add_initial_fact.argtypes = [ctypes.c_int]
 cpor_lib.add_initial_false_fact.argtypes = [ctypes.c_int]
 cpor_lib.add_initial_function_value.argtypes = [ctypes.c_int, ctypes.c_double]
@@ -110,6 +112,11 @@ cpor_lib.get_node_info.restype = None
 def load_problem_to_cpp(grounded_data: Dict[str, Any]) -> None:
     print("[NativeAPI] Initializing C++ Environment...")
     cpor_lib.init_problem(grounded_data['total_predicates'], grounded_data.get('total_functions', 0))
+    # Plan Graph Compaction (Option B) gate: mirrors the legacy C# engine's
+    # Domain.IsSimple exactly (see problem_grounder.py's generate_native_problem
+    # for where this is computed). Must be set right after init_problem(), which
+    # resets is_simple to its safe default (false, compaction off).
+    cpor_lib.set_problem_is_simple(bool(grounded_data.get('is_simple', False)))
 
     # Load Initial State
     for fact in grounded_data['initial_true']:

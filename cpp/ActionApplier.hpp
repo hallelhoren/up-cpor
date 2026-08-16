@@ -19,7 +19,7 @@ public:
             state.set_known_value(eff.first, eff.second);
         }
 
-        // 2. Apply Numeric Effects (Phase 3 Integration)
+        // 2. Apply Numeric Effects
         for (const auto& num_eff : action.numeric_effects) {
             state.apply_numeric_effect(num_eff);
         }

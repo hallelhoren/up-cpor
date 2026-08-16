@@ -40,6 +40,15 @@ extern "C" {
         get_global_problem().initial_true_facts.push_back(fact_id);
     }
 
+    // Sets ProblemDef::is_simple (see its own doc comment in ProblemData.hpp).
+    // The Python grounder is the only real caller: it computes this exactly
+    // like the legacy C# engine's Domain.IsSimple (false iff any action has a
+    // conditional effect) and calls this once per problem load, after
+    // init_problem() (which resets is_simple to its safe default, false).
+    void set_problem_is_simple(bool is_simple) {
+        get_global_problem().is_simple = is_simple;
+    }
+
     void add_initial_function_value(int func_id, double value) {
         // We store it as a pair to be applied during state construction
         get_global_problem().initial_function_values.push_back({func_id, value});
@@ -123,11 +132,20 @@ extern "C" {
                 ConditionalEffect ce;
                 for (int i = 0; i < cond_len; ++i) ce.condition_rpn.push_back(cond_rpn[i]);
                 for (int i = 0; i < eff_len; ++i) ce.effects.push_back({eff_facts[i], eff_vals[i] != 0});
-                
+
                 action.conditional_effects.push_back(ce);
                 return;
             }
         }
+        // action_id must already exist (create_action/add_grounded_action_to_cpp
+        // is always called before any of its conditional effects are added --
+        // see native_api.py's load_problem_to_cpp). Silently doing nothing here
+        // would drop the conditional effect without a trace, corrupting the
+        // action's semantics for a reason invisible from either side of the
+        // ABI. Surface it the same way other grounding-contract violations in
+        // this file already do.
+        std::cerr << "CRITICAL: add_conditional_effect_to_action called for unknown action_id "
+                  << action_id << " -- conditional effect dropped." << std::endl;
     }
 
 
@@ -192,7 +210,6 @@ extern "C" {
         std::vector<int> current_path_indices;        // Preallocate reasonable depth to prevent vector resizing mid-search
         current_path_indices.reserve(1024);
 
-        //DEBUG
         std::cout << "Initial State: " << std::endl;
         std::cout << "Known Mask: ";
         for (size_t i = 0; i < initial_state.known_mask.size(); ++i) {
@@ -209,17 +226,19 @@ extern "C" {
         bool success;
         try {
             success = global_solver->solve_from_node(root_idx, current_path_indices);
-        } catch (const std::bad_alloc&) {
+        } catch (const std::exception& e) {
             // Same reasoning as CPORSolver::fallback_to_exhaustive_search's
             // identical catch: the exhaustive search can combinatorially
             // explode on some domains (a known, pre-existing FF/solve_from_node
             // characteristic, out of scope to fix here); left uncaught here --
             // this is solve_from_node's OTHER direct call site, invoked at the
             // true root rather than via the fallback -- an allocation failure
-            // would cross the ctypes boundary as an unhandled exception and
-            // abort the whole host process. Report failure instead.
-            std::cerr << "[solve_native] CRITICAL: exhaustive search ran out of memory "
-                      << "(std::bad_alloc) -- reporting unsolvable instead of crashing." << std::endl;
+            // (or any other exception -- e.g. a malformed RPN tripping
+            // Evaluator's/Z3Manager's own std::runtime_error checks) would
+            // cross the ctypes boundary as an unhandled exception and abort
+            // the whole host process. Report failure instead.
+            std::cerr << "[solve_native] CRITICAL: exhaustive search threw " << e.what()
+                      << " -- reporting unsolvable instead of crashing." << std::endl;
             success = false;
         }
 
@@ -306,7 +325,18 @@ extern "C" {
     // return contract directly.
     int sdr_get_next_action() {
         if (!global_sdr_session) return -2;
-        return global_sdr_session->get_next_action();
+        try {
+            return global_sdr_session->get_next_action();
+        } catch (const std::exception&) {
+            // A malformed RPN reaching Evaluator/Z3Manager (stack underflow,
+            // overflow, or a bad translation) would otherwise cross this
+            // extern "C" boundary as an uncaught C++ exception -- undefined
+            // behavior, in practice std::terminate()/abort() of the whole
+            // host process. Report a clean failure instead, exactly like the
+            // solved/unsolved sentinel already used by every other return
+            // path here.
+            return -2;
+        }
     }
 
     // Answers the sensing action most recently returned by
@@ -316,7 +346,12 @@ extern "C" {
     // the problem's oneof invariants.
     bool sdr_apply_observation(bool observation_value) {
         if (!global_sdr_session) return false;
-        return global_sdr_session->apply_observation(observation_value);
+        try {
+            return global_sdr_session->apply_observation(observation_value);
+        } catch (const std::exception&) {
+            // See sdr_get_next_action's identical guard above.
+            return false;
+        }
     }
 
     void sdr_session_destroy() {
@@ -328,7 +363,23 @@ extern "C" {
     // =====================================================================
     // PLAN EXTRACTION GETTERS FOR PYTHON
     // =====================================================================
+    // node_idx crosses the ctypes boundary as a plain int under Python's
+    // control (problem_grounder.py's extract_node recursion, or any other
+    // caller), and CPORSolver::get_node()/node_pool's operator[] performs no
+    // bounds checking of its own -- an out-of-range or stale idx (e.g. called
+    // before any solve, or after a different problem was loaded) would
+    // silently read adjacent heap memory rather than fail cleanly. Every
+    // getter below validates node_idx against get_node_count() first and
+    // returns the same "nothing here" sentinel (-1, matching single/true/
+    // false_child_idx's own default and the -1 chosen_action_id already means
+    // for a solved-but-actionless leaf) instead of touching node_pool.
+    static bool is_valid_node_idx(int node_idx) {
+        return global_solver != nullptr && node_idx >= 0 &&
+               static_cast<size_t>(node_idx) < global_solver->get_node_count();
+    }
+
     int get_chosen_action(int node_idx) {
+        if (!is_valid_node_idx(node_idx)) return -1;
         return global_solver->get_node(node_idx).chosen_action_id;
     }
 
@@ -340,22 +391,25 @@ extern "C" {
     // tree must check this explicitly rather than inferring "failed" from
     // get_chosen_action() == -1 alone.
     int get_node_is_solved(int node_idx) {
+        if (!is_valid_node_idx(node_idx)) return 0;
         return global_solver->get_node(node_idx).is_solved ? 1 : 0;
     }
-    
-    int get_single_child(int node_idx) { 
-        return global_solver->get_node(node_idx).single_child_idx; 
-    }
-    
-    int get_true_child(int node_idx) { 
-        return global_solver->get_node(node_idx).true_child_idx; 
-    }
-    
-    int get_false_child(int node_idx) { 
-        return global_solver->get_node(node_idx).false_child_idx; 
+
+    int get_single_child(int node_idx) {
+        if (!is_valid_node_idx(node_idx)) return -1;
+        return global_solver->get_node(node_idx).single_child_idx;
     }
 
-    //DEBUGGING FUNCTION TO VERIFY PROBLEM LOADING
+    int get_true_child(int node_idx) {
+        if (!is_valid_node_idx(node_idx)) return -1;
+        return global_solver->get_node(node_idx).true_child_idx;
+    }
+
+    int get_false_child(int node_idx) {
+        if (!is_valid_node_idx(node_idx)) return -1;
+        return global_solver->get_node(node_idx).false_child_idx;
+    }
+
     // Validation interface for Python testing
     // Returns 1 for True, 0 for False, and -1 for Unknown
     int check_initial_state_fluent(int fluent_id) {
@@ -378,23 +432,29 @@ extern "C" {
         return -1; 
     }
 
+    // action_id < 0 is already rejected by the >= comparison below today (a
+    // negative int promotes to a huge value against the unsigned .size()),
+    // but that safety is an accident of signed/unsigned promotion rather than
+    // a stated invariant -- made explicit here so it can't be silently lost
+    // by some future refactor of the comparison (e.g. switching operand
+    // order, or comparing against a signed count instead).
     int get_action_precondition_len(int action_id) {
-        if (action_id >= get_global_problem().actions.size()) return -1;
+        if (action_id < 0 || static_cast<size_t>(action_id) >= get_global_problem().actions.size()) return -1;
         return get_global_problem().actions[action_id].precondition_rpn.size();
     }
 
     int get_action_guaranteed_effect_count(int action_id) {
-        if (action_id >= get_global_problem().actions.size()) return -1;
+        if (action_id < 0 || static_cast<size_t>(action_id) >= get_global_problem().actions.size()) return -1;
         return get_global_problem().actions[action_id].guaranteed_effects.size();
     }
 
     int get_action_conditional_effect_count(int action_id) {
-        if (action_id >= get_global_problem().actions.size()) return -1;
+        if (action_id < 0 || static_cast<size_t>(action_id) >= get_global_problem().actions.size()) return -1;
         return get_global_problem().actions[action_id].conditional_effects.size();
     }
 
     int get_action_observe_id(int action_id) {
-        if (action_id >= get_global_problem().actions.size()) return -1;
+        if (action_id < 0 || static_cast<size_t>(action_id) >= get_global_problem().actions.size()) return -1;
         return get_global_problem().actions[action_id].observe_predicate_id;
     }
     // ==================================================================
@@ -473,8 +533,17 @@ extern "C" {
 
     // Safely populates the caller's pre-allocated arrays to avoid memory leaks across the C-ABI
     void get_node_info(int idx, int* action_id, int* observe_id, int* num_children, int* children_indices, int* children_obs_values) {
-        const CPOR::PlanNode& node = global_solver->get_node(idx); 
-        
+        if (!is_valid_node_idx(idx)) {
+            // Same "nothing here" contract as the getters above -- idx is
+            // caller-controlled across the ctypes boundary, so this must fail
+            // cleanly rather than index node_pool out of bounds.
+            *action_id = -1;
+            *observe_id = -1;
+            *num_children = 0;
+            return;
+        }
+        const CPOR::PlanNode& node = global_solver->get_node(idx);
+
         *action_id = node.chosen_action_id;
         
         // If it's a leaf/goal node with no action

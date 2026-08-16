@@ -43,7 +43,7 @@ public:
 
         // Memory Arena: Preallocate to prevent vector reallocations and memory fragmentation
         std::vector<BFSNode> node_arena;
-        node_arena.reserve(static_cast<size_t>(max_expansions) + 1); // Tune based on average problem size
+        node_arena.reserve(static_cast<size_t>(max_expansions) + 1);
 
         // Map state hash directly to its index in the node_arena
         std::unordered_map<PartiallySpecifiedState, int, StateHasher> visited;
@@ -72,13 +72,11 @@ public:
             // We just expand the current node here.
             
             for (const auto& action : problem.actions) {
-                // Check applicability deterministically
                 if (Evaluator::evaluate(action.precondition_rpn, curr_state, EvalMode::PESSIMISTIC)) {
-                    
+
                     PartiallySpecifiedState next_state = curr_state;
                     ActionApplier::apply_action(action, next_state);
 
-                    // If unvisited, generate node
                     if (visited.find(next_state) == visited.end()) {
                         
                         // Goal Evaluation on PUSH (Optimal for BFS uniform cost)

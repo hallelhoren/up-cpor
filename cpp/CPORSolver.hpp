@@ -36,6 +36,20 @@ struct PlanNode {
     bool is_failed{false};
     int chosen_action_id{-1};
 
+    // Plan Graph Compaction (Option B, problem.is_simple only): the CPOR
+    // paper's K(n)/H(n) -- relevant known/hidden literals for the subtree
+    // rooted here -- computed bottom-up once this node is solved (see
+    // CPORSolver::compute_and_register_relevance). relevant_known is a set
+    // of (fact_id, required_value) literals; relevant_hidden is a set of
+    // fact_ids that must still be unknown. has_relevance is false whenever
+    // problem.is_simple is false, or the node's own action/goal formula
+    // wasn't representable as a flat literal conjunction (see
+    // try_extract_literal_conjunction) -- either way, the node simply never
+    // participates in compaction, which is always safe (just less compact).
+    std::vector<std::pair<int, bool>> relevant_known{};
+    std::vector<int> relevant_hidden{};
+    bool has_relevance{false};
+
     PlanNode(const PartiallySpecifiedState& s, int act_id) : state(s), action_id(act_id) {}
 };
 
@@ -49,7 +63,12 @@ private:
     // projected state reached via different candidates/branches would otherwise pay
     // for a fresh bounded BFS every time.
     std::unordered_map<PartiallySpecifiedState, int, StateHasher> heuristic_cache;
-    
+
+    // Plan Graph Compaction (Option B) registry: node_idx values with
+    // has_relevance == true, scanned by find_closed_relevance_match(). See
+    // the "Plan Graph Compaction" section below for the full mechanism.
+    std::vector<int> closed_registry;
+
     struct ActionCandidate {
         int action_idx;
         int h_score;
@@ -172,6 +191,70 @@ private:
     bool try_resolve_via_sensing_branch(int cursor_idx, int blocking_action_id, const PartiallySpecifiedState& belief,
                                          const ProblemDef& problem, std::vector<int>& open_stack,
                                          const std::vector<int>* blocking_fact_tokens = nullptr);
+
+    // -------------------------------------------------------------------
+    // Plan Graph Compaction (Option B): CPOR TAAS 2022 Algorithm 3/4
+    // (GetClosedNode/UpdateClosedNodes in the paper; IsClosedState/
+    // UpdateClosedStates in the legacy C# CPORPlanner/PartiallySpecifiedState,
+    // which this ports). Strictly gated on problem.is_simple -- see
+    // ProblemData.hpp's doc comment on that field for why applying this to
+    // non-simple domains (any conditional effect anywhere in the problem) is
+    // a soundness hazard, not just a missed-compaction one.
+    //
+    // Deliberately simpler than the C# original in one respect: this engine
+    // eagerly resolves oneof/provenance deductions into a node's belief the
+    // moment the node is created (apply_oneof_deductions/
+    // apply_provenance_deductions, called from expand_sensing_node), so unlike
+    // C#'s lazier belief representation there is no separate "reasoned but not
+    // yet folded into the belief" state to track -- every deducible fact is
+    // already baked into known_mask/value_mask by construction. That means
+    // the paper's O(n,l) bookkeeping (which observation sequences let you
+    // *reason* your way to a relevant hidden fact, Algorithm 4's
+    // ReasonedT/ReasonedF) has no equivalent need here: this port tracks only
+    // K(n)/H(n), not O(n,l). The only cost of that simplification is
+    // possibly-less-than-C#'s compaction on domains whose compactness
+    // specifically depends on reusing plans across states that agree only
+    // after such reasoning -- never a soundness cost: omitting O(n,l) can
+    // only make the K(n')/H(n') containment checks below stricter than the
+    // full algorithm's, which can only reject valid merges, never accept an
+    // invalid one.
+    // -------------------------------------------------------------------
+
+    // A literal is (fact_id, required_value): required_value == true means
+    // the fact must be known-true, false means known-false.
+    using RelevantLiteral = std::pair<int, bool>;
+
+    // Attempts to read `rpn` as a flat conjunction of (possibly negated)
+    // literals -- the model the CPOR paper's own "simple problem" formalism
+    // assumes preconditions/goals take (§2.1: "we can use the simpler STRIPS
+    // definition, where the action effects are sets of literals"). Returns
+    // {false, {}} for anything else (a genuine OR/EQUALS anywhere, or NOT
+    // applied to more than a single literal) rather than guessing -- a node
+    // whose action or goal formula isn't literal-representable this way
+    // simply never gets has_relevance=true, which safely (if conservatively)
+    // excludes it from compaction rather than risking an unsound merge.
+    static std::pair<bool, std::vector<RelevantLiteral>> try_extract_literal_conjunction(const std::vector<int>& rpn);
+
+    // Computes node_idx's own K(n)/H(n) from its (already-closed) child or
+    // children's K/H plus its own action's precondition literals (CPOR TAAS
+    // 2022 Equations 6-11, sans O(n,l) -- see the class-level comment above),
+    // and registers it in closed_registry if computable. No-op if
+    // problem.is_simple is false, node_idx already has_relevance, or any
+    // formula involved isn't literal-representable (has_relevance is simply
+    // left false in that case -- see try_extract_literal_conjunction). Must
+    // only be called once node_idx.is_solved is true and its
+    // chosen_action_id/single_child_idx/true_child_idx/false_child_idx are
+    // in their final state.
+    void compute_and_register_relevance(int node_idx);
+
+    // Linear scan over closed_registry (mirrors the legacy C#'s own
+    // foreach-over-lClosedStates scan in IsClosedState) for a previously
+    // closed node whose K(n')/H(n') both hold against `belief`: every literal
+    // in K(n') matches belief's known value for that fact, and every fact_id
+    // in H(n') is still unknown in belief. Returns the matched node_idx, or
+    // -1 if none qualifies (the common case, and always safe: no match just
+    // means normal solving proceeds as before this mechanism existed).
+    int find_closed_relevance_match(const PartiallySpecifiedState& belief) const;
 
 public:
     CPORSolver() {

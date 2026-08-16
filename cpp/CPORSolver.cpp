@@ -199,6 +199,18 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
         node_pool[node_idx].single_child_idx = original.single_child_idx;
         node_pool[node_idx].true_child_idx = original.true_child_idx;
         node_pool[node_idx].false_child_idx = original.false_child_idx;
+        // Carry over Plan Graph Compaction relevance too (safe: node_idx's
+        // belief is bit-identical to `original`'s, since solved_cache keys
+        // on exact PartiallySpecifiedState equality) -- otherwise a parent
+        // relying on node_idx as its child would see has_relevance == false
+        // and lose an otherwise-valid compaction opportunity. This function
+        // itself never CALLS compute_and_register_relevance (Option B's
+        // hooks are scoped to solve_cpor_loop/close_node_and_propagate
+        // only), so this copy-through is the only way solve_from_node's own
+        // cache hits stay compaction-eligible.
+        node_pool[node_idx].relevant_known = original.relevant_known;
+        node_pool[node_idx].relevant_hidden = original.relevant_hidden;
+        node_pool[node_idx].has_relevance = original.has_relevance;
         if (out_lowlink) *out_lowlink = NO_CYCLE;
         return true;
     }
@@ -456,20 +468,25 @@ bool CPORSolver::fallback_to_exhaustive_search(int node_idx) {
     bool result;
     try {
         result = solve_from_node(node_idx, path);
-    } catch (const std::bad_alloc&) {
+    } catch (const std::exception&) {
         // The exhaustive search can combinatorially explode on some domains
         // (FF's relaxed-planning-graph fixpoint computation and/or this
         // search's own node_pool growth have no protection against it -- a
         // known, pre-existing characteristic of solve_from_node/FF, out of
-        // scope to fix here). Left uncaught, this would cross the
-        // extern "C"/ctypes boundary as an unhandled C++ exception, which
-        // the runtime turns into std::terminate() -> abort(), crashing the
-        // whole host process. Graceful degradation instead: treat this
-        // subtree as a failure -- NOT cached in failed_cache, since running
-        // out of memory proves nothing about the belief's true solvability,
-        // only that this attempt couldn't finish; a cheaper path reaching
-        // the same belief later should get to try again, not be told it's
-        // already known unsolvable.
+        // scope to fix here), which throws std::bad_alloc. Evaluator/
+        // Z3Manager can also throw plain std::runtime_error on a malformed
+        // RPN formula reaching them -- a grounding-contract violation that
+        // should never happen for a validly-grounded problem, but is a
+        // dynamic-boundary risk, not a static one, since RPN arrays cross
+        // the ctypes boundary as raw int arrays with no schema check on this
+        // side. Left uncaught, either would cross the extern "C"/ctypes
+        // boundary as an unhandled C++ exception, which the runtime turns
+        // into std::terminate() -> abort(), crashing the whole host process.
+        // Graceful degradation instead: treat this subtree as a failure --
+        // NOT cached in failed_cache, since neither exception proves the
+        // belief itself is unsolvable, only that this attempt couldn't
+        // finish; a cheaper path reaching the same belief later should get
+        // to try again, not be told it's already known unsolvable.
         result = false;
     }
     if (!result) {
@@ -509,6 +526,9 @@ void CPORSolver::close_node_and_propagate(int node_idx) {
         if (node_pool[node_idx].is_solved) {
             node_pool[parent_idx].is_solved = true;
             solved_cache[node_pool[parent_idx].state] = parent_idx;
+            if (get_global_problem().is_simple) {
+                compute_and_register_relevance(parent_idx);
+            }
             close_node_and_propagate(parent_idx);
         } else {
             // node_idx (the only child) failed -- give the exhaustive search
@@ -531,6 +551,9 @@ void CPORSolver::close_node_and_propagate(int node_idx) {
     if (true_solved && false_solved) {
         node_pool[parent_idx].is_solved = true;
         solved_cache[node_pool[parent_idx].state] = parent_idx;
+        if (get_global_problem().is_simple) {
+            compute_and_register_relevance(parent_idx);
+        }
         close_node_and_propagate(parent_idx);
     } else {
         // One branch of this committed sensing action is a definitive dead
@@ -589,6 +612,196 @@ bool CPORSolver::try_resolve_via_sensing_branch(int cursor_idx, int blocking_act
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Plan Graph Compaction (Option B): CPOR TAAS 2022 Algorithm 3/4 port.
+// See CPORSolver.hpp's class-level comment on this section for the full
+// design rationale (is_simple gating, why O(n,l) is omitted).
+// -----------------------------------------------------------------------------
+
+std::pair<bool, std::vector<CPORSolver::RelevantLiteral>> CPORSolver::try_extract_literal_conjunction(const std::vector<int>& rpn) {
+    if (rpn.empty()) return {true, {}}; // Evaluator treats an empty RPN as trivially true.
+
+    // Each stack entry is a flat conjunction of literals (possibly empty,
+    // meaning "trivially true"). OP_AND merges two entries; anything else
+    // that isn't a plain literal or a NOT of a single literal means the
+    // formula isn't representable this way -- bail rather than guess.
+    std::vector<std::vector<RelevantLiteral>> stack;
+    for (int token : rpn) {
+        if (token >= 0) {
+            stack.push_back({ {token, true} });
+        } else if (token == OP_TRUE) {
+            stack.push_back({});
+        } else if (token == OP_NOT) {
+            if (stack.empty()) return {false, {}};
+            std::vector<RelevantLiteral> top = std::move(stack.back());
+            stack.pop_back();
+            if (top.size() != 1) return {false, {}}; // De Morgan'ing a conjunction isn't a flat literal.
+            top[0].second = !top[0].second;
+            stack.push_back(std::move(top));
+        } else if (token == OP_AND) {
+            if (stack.size() < 2) return {false, {}};
+            std::vector<RelevantLiteral> right = std::move(stack.back()); stack.pop_back();
+            std::vector<RelevantLiteral> left = std::move(stack.back()); stack.pop_back();
+            left.insert(left.end(), right.begin(), right.end());
+            stack.push_back(std::move(left));
+        } else {
+            // OP_OR, OP_EQUALS, OP_ONEOF, OP_FALSE: not a flat literal conjunction.
+            return {false, {}};
+        }
+    }
+    if (stack.size() != 1) return {false, {}};
+    return {true, std::move(stack.back())};
+}
+
+void CPORSolver::compute_and_register_relevance(int node_idx) {
+    const ProblemDef& problem = get_global_problem();
+    if (!problem.is_simple) return;
+
+    PlanNode& node = node_pool[node_idx];
+    if (node.has_relevance || !node.is_solved) return;
+
+    std::vector<RelevantLiteral> combined_known;
+    std::vector<int> combined_hidden;
+
+    if (node.chosen_action_id == -1) {
+        // Goal leaf: reused whenever a future belief already satisfies the
+        // goal formula's own literals.
+        auto extracted = try_extract_literal_conjunction(problem.goal_rpn);
+        if (!extracted.first) return;
+        combined_known = std::move(extracted.second);
+    } else {
+        const GroundedAction& action = problem.actions[node.chosen_action_id];
+        // is_simple guarantees no action anywhere has conditional effects,
+        // but stay defensive rather than assume the grounder honored that.
+        if (!action.conditional_effects.empty()) return;
+
+        auto pre_extracted = try_extract_literal_conjunction(action.precondition_rpn);
+        if (!pre_extracted.first) return;
+        combined_known = pre_extracted.second;
+
+        if (node.true_child_idx != -1 || node.false_child_idx != -1) {
+            // Sensing (AND) node. expand_sensing_node never applies the
+            // action's own guaranteed/non-deterministic effects (it only
+            // resolves the observed fluent + deductions), so no effect
+            // regression is needed here -- just union both children's
+            // externally-required facts (minus the observed fluent itself,
+            // which isn't known pre-sensing by definition). Union, not
+            // intersection: reusing this WHOLE subtree means committing to
+            // BOTH children's plans verbatim, so a candidate belief must
+            // directly satisfy everything either branch relies on -- see
+            // the class comment for why relying on deduction closure alone
+            // here would be unsound.
+            int t_idx = node.true_child_idx;
+            int f_idx = node.false_child_idx;
+            if (t_idx == -1 || f_idx == -1) return;
+            const PlanNode& tchild = node_pool[t_idx];
+            const PlanNode& fchild = node_pool[f_idx];
+            if (!tchild.has_relevance || !fchild.has_relevance) return;
+
+            int observe_fluent = action.observe_predicate_id;
+            if (observe_fluent < 0) return;
+
+            for (const auto& lit : tchild.relevant_known) {
+                if (lit.first != observe_fluent) combined_known.push_back(lit);
+            }
+            for (const auto& lit : fchild.relevant_known) {
+                if (lit.first != observe_fluent) combined_known.push_back(lit);
+            }
+
+            combined_hidden.push_back(observe_fluent);
+            for (int fid : tchild.relevant_hidden) if (fid != observe_fluent) combined_hidden.push_back(fid);
+            for (int fid : fchild.relevant_hidden) if (fid != observe_fluent) combined_hidden.push_back(fid);
+        } else {
+            // Classical (OR) node: regress the single child's requirements
+            // back through this action's effects.
+            int child_idx = node.single_child_idx;
+            if (child_idx == -1) return;
+            const PlanNode& child = node_pool[child_idx];
+            if (!child.has_relevance) return;
+
+            std::unordered_set<int> det_written;
+            for (const auto& eff : action.guaranteed_effects) det_written.insert(eff.first);
+            std::unordered_set<int> nondet_written;
+            for (int fid : action.non_deterministic_effects) nondet_written.insert(fid);
+
+            for (const auto& lit : child.relevant_known) {
+                if (det_written.count(lit.first)) continue; // guaranteed by this action regardless of pre-state
+                if (nondet_written.count(lit.first)) return; // self-consistency violation; bail defensively
+                combined_known.push_back(lit);
+            }
+            for (int fid : child.relevant_hidden) {
+                if (nondet_written.count(fid)) continue; // guaranteed unknown by this action regardless of pre-state
+                if (det_written.count(fid)) return; // self-consistency violation; bail defensively
+                combined_hidden.push_back(fid);
+            }
+        }
+    }
+
+    // Dedupe combined_known (identical duplicate literals are harmless; a
+    // duplicate fact with CONFLICTING required values means the formula can
+    // never be satisfied by any real belief -- bail rather than register
+    // something vacuous).
+    std::vector<RelevantLiteral> deduped_known;
+    for (const auto& lit : combined_known) {
+        bool conflict = false;
+        bool already_present = false;
+        for (const auto& existing : deduped_known) {
+            if (existing.first == lit.first) {
+                already_present = true;
+                if (existing.second != lit.second) conflict = true;
+                break;
+            }
+        }
+        if (conflict) return;
+        if (!already_present) deduped_known.push_back(lit);
+    }
+    std::vector<int> deduped_hidden;
+    for (int fid : combined_hidden) {
+        if (std::find(deduped_hidden.begin(), deduped_hidden.end(), fid) == deduped_hidden.end()) {
+            deduped_hidden.push_back(fid);
+        }
+    }
+    // A fact can't be simultaneously required known and required hidden.
+    for (const auto& lit : deduped_known) {
+        if (std::find(deduped_hidden.begin(), deduped_hidden.end(), lit.first) != deduped_hidden.end()) return;
+    }
+
+    // Final safety net: K(n)/H(n) must actually hold against node's OWN
+    // belief (reflexivity) -- catches any bug in the regression above rather
+    // than risk registering an unsound signature. Cheap relative to the
+    // search itself, and this function only runs on solved nodes under
+    // problem.is_simple.
+    for (const auto& lit : deduped_known) {
+        bool holds = lit.second ? node.state.is_true(lit.first) : node.state.is_false(lit.first);
+        if (!holds) return;
+    }
+    for (int fid : deduped_hidden) {
+        if (!node.state.is_unknown(fid)) return;
+    }
+
+    node.relevant_known = std::move(deduped_known);
+    node.relevant_hidden = std::move(deduped_hidden);
+    node.has_relevance = true;
+    closed_registry.push_back(node_idx);
+}
+
+int CPORSolver::find_closed_relevance_match(const PartiallySpecifiedState& belief) const {
+    for (int idx : closed_registry) {
+        const PlanNode& candidate = node_pool[idx];
+        bool ok = true;
+        for (const auto& lit : candidate.relevant_known) {
+            bool holds = lit.second ? belief.is_true(lit.first) : belief.is_false(lit.first);
+            if (!holds) { ok = false; break; }
+        }
+        if (!ok) continue;
+        for (int fid : candidate.relevant_hidden) {
+            if (!belief.is_unknown(fid)) { ok = false; break; }
+        }
+        if (ok) return idx;
+    }
+    return -1;
+}
+
 bool CPORSolver::solve_cpor_loop(int root_idx) {
     const ProblemDef& problem = get_global_problem();
     std::vector<int> open_stack;
@@ -633,6 +846,18 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
             node_pool[node_idx].single_child_idx = original.single_child_idx;
             node_pool[node_idx].true_child_idx = original.true_child_idx;
             node_pool[node_idx].false_child_idx = original.false_child_idx;
+            // See the identical copy-through in the "0b." block below and in
+            // solve_from_node's own cache-hit mirror: without this, a node
+            // resolved via this exact-belief cache hit would silently never
+            // become compaction-eligible (has_relevance stays false), which
+            // then blocks EVERY ancestor relying on it as a child from ever
+            // computing its own relevance either -- this was the actual
+            // dominant cause of low compaction observed on doors5 (bailed
+            // as "child lacks relevance" far more often than any other
+            // reason) until this copy-through was added.
+            node_pool[node_idx].relevant_known = original.relevant_known;
+            node_pool[node_idx].relevant_hidden = original.relevant_hidden;
+            node_pool[node_idx].has_relevance = original.has_relevance;
             close_node_and_propagate(node_idx);
             continue;
         }
@@ -642,10 +867,39 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
             continue;
         }
 
+        // 0b. Plan Graph Compaction (Option B): a previously closed node
+        // whose K(n')/H(n') both hold against this belief can be aliased
+        // wholesale -- see CPORSolver.hpp's "Plan Graph Compaction" section
+        // for the full soundness argument. find_closed_relevance_match is
+        // always safe to call (returns -1, a no-op, whenever closed_registry
+        // is empty -- e.g. every non-simple problem, since
+        // compute_and_register_relevance itself is a no-op there too), but
+        // gate on problem.is_simple anyway as an explicit, redundant
+        // safeguard against ever compacting a non-simple domain.
+        if (problem.is_simple) {
+            int relevance_match = find_closed_relevance_match(node_belief);
+            if (relevance_match != -1) {
+                const PlanNode& original = node_pool[relevance_match];
+                node_pool[node_idx].is_solved = true;
+                node_pool[node_idx].chosen_action_id = original.chosen_action_id;
+                node_pool[node_idx].single_child_idx = original.single_child_idx;
+                node_pool[node_idx].true_child_idx = original.true_child_idx;
+                node_pool[node_idx].false_child_idx = original.false_child_idx;
+                node_pool[node_idx].relevant_known = original.relevant_known;
+                node_pool[node_idx].relevant_hidden = original.relevant_hidden;
+                node_pool[node_idx].has_relevance = original.has_relevance;
+                close_node_and_propagate(node_idx);
+                continue;
+            }
+        }
+
         // 1. Goal check.
         if (Evaluator::evaluate(problem.goal_rpn, node_belief, EvalMode::PESSIMISTIC)) {
             node_pool[node_idx].is_solved = true;
             solved_cache[node_belief] = node_idx;
+            if (problem.is_simple) {
+                compute_and_register_relevance(node_idx);
+            }
             close_node_and_propagate(node_idx);
             continue;
         }
@@ -755,6 +1009,9 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
             if (Evaluator::evaluate(problem.goal_rpn, cursor_belief, EvalMode::PESSIMISTIC)) {
                 node_pool[cursor_idx].is_solved = true;
                 solved_cache[cursor_belief] = cursor_idx;
+                if (problem.is_simple) {
+                    compute_and_register_relevance(cursor_idx);
+                }
                 close_node_and_propagate(cursor_idx);
             } else {
                 std::vector<int> goal_blocking_tokens;
@@ -787,12 +1044,13 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
         }
         // If branched, the two new children are already on open_stack and
         // will eventually resolve node_idx via close_node_and_propagate.
-        } catch (const std::bad_alloc&) {
-            // See the comment where this try begins. Not inserted into
-            // failed_cache: running out of memory proves nothing about
-            // node_idx's true solvability, only that this attempt couldn't
-            // finish (same reasoning as fallback_to_exhaustive_search's own
-            // catch).
+        } catch (const std::exception&) {
+            // See fallback_to_exhaustive_search's identical catch: covers
+            // both std::bad_alloc (out-of-memory during this iteration's own
+            // node_pool growth or FF's fixpoint computation) and a malformed
+            // RPN's std::runtime_error from Evaluator/Z3Manager. Not inserted
+            // into failed_cache: neither exception proves node_idx's true
+            // solvability, only that this attempt couldn't finish.
             node_pool[node_idx].is_failed = true;
             close_node_and_propagate(node_idx);
         }

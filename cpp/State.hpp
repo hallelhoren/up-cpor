@@ -46,7 +46,6 @@ public:
 
     PartiallySpecifiedState() = default;
 
-    // Constructor: sizes the bitset based on Total Predicates (N)
     PartiallySpecifiedState(int total_predicates, int total_functions = 0) {
         int blocks = (total_predicates / 64) + 1;
         known_mask.assign(blocks, 0ULL); 
@@ -63,7 +62,6 @@ public:
         function_values[id] = val;
     }
 
-    // Safely reads a function value
     // Returns NaN if the agent does not possess the knowledge
     double get_function_value(int id) const {
         if (known_function_mask[id / 64] & (1ULL << (id % 64))) {
@@ -93,21 +91,17 @@ public:
         }
     }
 
-    // Mathematical State Evaluation
     bool is_true(int id) const {
-        // True IF it is known AND its value is 1
-        return (known_mask[id / 64] & (1ULL << (id % 64))) && 
+        return (known_mask[id / 64] & (1ULL << (id % 64))) &&
                (value_mask[id / 64] & (1ULL << (id % 64)));
     }
 
-    //Explicit FALSE evaluation. Must be KNOWN and VALUE == 0.
     bool is_false(int id) const {
         uint64_t bit = 1ULL << (id % 64);
         return (known_mask[id / 64] & bit) && !(value_mask[id / 64] & bit);
     }
 
     bool is_unknown(int id) const {
-        // Unknown IF the known_mask bit is 0
         return !(known_mask[id / 64] & (1ULL << (id % 64)));
     }
     
@@ -119,11 +113,11 @@ public:
     // unrelated action directly (re)setting this fact) call
     // clear_provenance() explicitly instead -- see ActionApplier.
     void set_known_value(int id, bool value) {
-        known_mask[id / 64] |= (1ULL << (id % 64)); // Mark as known (1)
+        known_mask[id / 64] |= (1ULL << (id % 64));
         if (value)
-            value_mask[id / 64] |= (1ULL << (id % 64)); // Set True
+            value_mask[id / 64] |= (1ULL << (id % 64));
         else
-            value_mask[id / 64] &= ~(1ULL << (id % 64)); // Set False
+            value_mask[id / 64] &= ~(1ULL << (id % 64));
     }
 
     // Explicitly discards a stale provenance entry -- used when an
@@ -232,7 +226,6 @@ public:
         return any_changed;
     }
 
-    // Applies SDR Logical Deduction across all OneOf constraints
     // Returns false if a logical contradiction is found (dead-end state)
     bool apply_oneof_deductions(const std::vector<std::vector<int>>& oneof_groups) {
         bool state_changed = true;

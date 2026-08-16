@@ -45,17 +45,12 @@ struct GroundedAction {
     int id{0};
     int cost{1};
 
-    /* @brief Human-readable name. Used strictly for debugging and output formatting. 
-    std::string name{}; */
-
     /** * @brief Flattened Reverse Polish Notation (RPN) array of the logic formula.
      * * By flattening the abstract syntax tree into a contiguous array, we guarantee 
      * cache-friendly sequential memory access. A stack-based evaluator iterating over 
      * this vector is significantly faster than recursively traversing `CompoundFormula` objects.
      */
     std::vector<int> precondition_rpn{};
-
-    // std::vector<uint64_t> fast_precondition_mask{};
 
     /** * @brief The effects of the action, represented as a list of (predicate_id, new_truth_value).
      * * Using flat integer pairs eliminates the need for allocating `Predicate` objects on the heap.
@@ -115,6 +110,21 @@ struct ProblemDef {
 
     std::vector<int> auto_observable_predicates;
 
+    // Mirrors the legacy C# engine's Domain.IsSimple: false the instant any
+    // action anywhere in the problem has a conditional effect (see
+    // up_cpor.problem_grounder's generate_native_problem, which computes this
+    // exactly that way and is the only real setter -- see
+    // native_bridge.cpp's set_problem_is_simple). Gates CPORSolver's Plan
+    // Graph Compaction (K(n)/H(n) relevant-fluent belief-equivalence caching,
+    // CPOR TAAS 2022 Algorithm 3/4): applying that mechanism outside simple
+    // domains is a soundness hazard, not just a missed-optimization one --
+    // see CPORSolver.cpp's compute_and_register_relevance for why. Defaults
+    // to false (compaction off) so any caller that never explicitly sets
+    // this -- in particular every existing cpp/tests/*.cpp, which construct
+    // ProblemDef directly via the extern "C" API and never call
+    // set_problem_is_simple -- keeps exactly its prior behavior.
+    bool is_simple{false};
+
 };
 
 inline ProblemDef& get_global_problem() {
@@ -122,7 +132,6 @@ inline ProblemDef& get_global_problem() {
         return instance;
     }
 
-    // 2. THE CTYPES LIFECYCLE PROTECTOR
     // Forces a total wipe of the domain memory between PDDL runs.
     inline void reset_global_problem() {
         get_global_problem() = ProblemDef(); 

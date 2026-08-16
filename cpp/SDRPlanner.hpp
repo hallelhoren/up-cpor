@@ -88,7 +88,8 @@ public:
 
     bool execute_full_simulation();
 
-    //DEBUG
+    // Test hook: forces the internal plan queue for whitebox testing
+    // (see tests/test_sdr_full_lifecycle.cpp).
     void set_plan_queue(const std::vector<int>& forced_plan) {
         plan_queue = forced_plan;
         next_action_index = 0; 

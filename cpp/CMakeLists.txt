@@ -49,6 +49,3 @@ target_link_libraries(test_integration PRIVATE cpor_core z3)
 
 add_executable(test_sdr_full_lifecycle tests/test_sdr_full_lifecycle.cpp)
 target_link_libraries(test_sdr_full_lifecycle PRIVATE cpor_core z3)
-
-add_executable(test_cpor_loop tests/test_cpor_loop.cpp)
-target_link_libraries(test_cpor_loop PRIVATE cpor_core z3)

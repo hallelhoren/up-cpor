@@ -27,6 +27,9 @@ dev = [
     "up-pyperplan",
 ]
 
+[project.scripts]
+up-cpor-run = "up_cpor.cli:main"
+
 [tool.setuptools]
 packages = ["CPORLib", "up_cpor"]
 
