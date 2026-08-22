@@ -324,6 +324,35 @@ int* ff_search(const uint64_t* determinized_state_bitset, int* out_plan_length) 
     return plan_array;
 }
 
+/* See ff_api.h's doc comment for the full rationale. */
+int ff_estimate_heuristic(const uint64_t* determinized_state_bitset,
+                           int* out_helpful_actions, int max_helpful_actions,
+                           int* out_num_helpful) {
+    if (!determinized_state_bitset || !gff_problem_loaded) {
+        if (out_num_helpful) *out_num_helpful = 0;
+        return -1;
+    }
+
+    /* Same bitset-to-FF-initial-state conversion as ff_search's step 1. */
+    ginitial_state.num_F = 0;
+    for (int i = 0; i < gnum_ft_conn; ++i) {
+        if (determinized_state_bitset[i / 64] & (1ULL << (i % 64))) {
+            ginitial_state.F[ginitial_state.num_F++] = i;
+        }
+    }
+
+    int h = get_1P_and_H(&ginitial_state, &ggoal_state);
+
+    int n = gnum_H;
+    if (out_helpful_actions && n > max_helpful_actions) n = max_helpful_actions;
+    if (out_helpful_actions) {
+        for (int i = 0; i < n; ++i) out_helpful_actions[i] = gH[i];
+    }
+    if (out_num_helpful) *out_num_helpful = out_helpful_actions ? n : gnum_H;
+
+    return h;
+}
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,9 @@ extern "C" {
         int num_goal_facts, const int* goal_facts
     );
     int* ff_search(const uint64_t* determinized_state_bitset, int* out_plan_length);
+    int ff_estimate_heuristic(const uint64_t* determinized_state_bitset,
+                               int* out_helpful_actions, int max_helpful_actions,
+                               int* out_num_helpful);
     void ff_reset_search_state();
     void ff_clear_hash_table();
 }
@@ -28,6 +31,7 @@ bool FFBridge::s_available = false;
 int FFBridge::s_total_predicates = 0;
 std::vector<int> FFBridge::s_shadow_fact_of;
 int FFBridge::s_num_ff_facts = 0;
+int FFBridge::s_num_ops = 0;
 
 namespace {
 
@@ -220,6 +224,21 @@ bool FFBridge::build(const ProblemDef& problem) {
             // prune a genuinely reachable action.
             guaranteed.effects.emplace_back(nd_fact, true);
         }
+        if (action.observe_predicate_id != -1) {
+            // Sensing itself has no direct effect on the world -- but for FF's
+            // reachability graph, credit it exactly the way a non-deterministic
+            // effect is credited just above: an optimistic relaxed add of the
+            // observed fact, at real unit action cost (ff_search's plan length
+            // already counts every operator, including this one, as one step).
+            // Without this, a pure :observe action (no guaranteed/conditional/
+            // non-deterministic effects at all) is completely invisible to FF --
+            // any plan that genuinely needs to sense before some other action's
+            // precondition can fire looks permanently unreachable. That's
+            // exactly the "heuristic is blind to the epistemic value of
+            // sensing" bug confirmed on localize5-tamer: 0 successful subtrees
+            // found across 300k+ search-node visits before this fix.
+            guaranteed.effects.emplace_back(action.observe_predicate_id, true);
+        }
         if (!guaranteed.effects.empty() || action.guaranteed_effects.empty()) {
             // Always register at least one effect (even a no-op one) so the
             // operator's own precondition is registered and it can be
@@ -339,6 +358,8 @@ bool FFBridge::build(const ProblemDef& problem) {
     }
     // Constant(true) goal: goal_facts stays empty, correctly "always satisfied".
 
+    s_num_ops = static_cast<int>(ops.size());
+
     int ok = ff_load_problem(
         s_num_ff_facts,
         static_cast<int>(ops.size()),
@@ -357,6 +378,22 @@ bool FFBridge::build(const ProblemDef& problem) {
         goal_facts.empty() ? nullptr : goal_facts.data()
     );
 
+    // Clears FF's longer-lived state-hash table -- distinct from
+    // ff_reset_search_state() (called at the top of every search() call, for
+    // per-search EHC/BFS progress flags only). Without this, a hash table
+    // that persists across every search() call within one problem's lifetime
+    // was never cleared BETWEEN problems either: a process that solves more
+    // than one problem in sequence (any test run exercising multiple domains,
+    // not just this specific one) reused stale entries keyed by a PREVIOUS
+    // problem's own fact/op numbering against a brand new problem's
+    // numbering, corrupting FF's search for every problem after the first.
+    // Confirmed via direct reproduction: localize5-tamer converges soundly in
+    // under 3 seconds run alone, but times out after 60+ seconds when even
+    // ONE other domain's problem was solved earlier in the same process --
+    // narrowed to this exact missing call (ff_clear_hash_table was declared
+    // in the extern "C" block above but never invoked anywhere).
+    ff_clear_hash_table();
+
     s_available = (ok != 0);
     return s_available;
 }
@@ -365,15 +402,7 @@ bool FFBridge::is_available() {
     return s_available;
 }
 
-std::vector<int> FFBridge::search(const PartiallySpecifiedState& concrete_state) {
-    if (!s_available) return {};
-
-    // Required before every search turn: clears FF's EHC/BFS hash tables and
-    // per-fact/per-op search-progress flags left over from the previous call.
-    ff_reset_search_state();
-
-    // Build the extended bitset: the original determinized facts, plus each
-    // negated-somewhere predicate's derived "not-P" shadow bit.
+std::vector<uint64_t> FFBridge::build_extended_bitset(const PartiallySpecifiedState& concrete_state) {
     std::vector<uint64_t> extended((static_cast<size_t>(s_num_ff_facts) / 64) + 1, 0ULL);
     for (int i = 0; i < s_total_predicates; ++i) {
         bool val = concrete_state.is_true(i);
@@ -384,6 +413,17 @@ std::vector<int> FFBridge::search(const PartiallySpecifiedState& concrete_state)
             extended[shadow / 64] |= (1ULL << (shadow % 64));
         }
     }
+    return extended;
+}
+
+std::vector<int> FFBridge::search(const PartiallySpecifiedState& concrete_state) {
+    if (!s_available) return {};
+
+    // Required before every search turn: clears FF's EHC/BFS hash tables and
+    // per-fact/per-op search-progress flags left over from the previous call.
+    ff_reset_search_state();
+
+    std::vector<uint64_t> extended = build_extended_bitset(concrete_state);
 
     int plan_length = 0;
     int* raw_plan = ff_search(extended.data(), &plan_length);
@@ -394,6 +434,30 @@ std::vector<int> FFBridge::search(const PartiallySpecifiedState& concrete_state)
     std::vector<int> plan(raw_plan, raw_plan + plan_length);
     std::free(raw_plan);
     return plan;
+}
+
+int FFBridge::estimate_heuristic(const PartiallySpecifiedState& concrete_state,
+                                   std::vector<int>& out_helpful_action_ids) {
+    out_helpful_action_ids.clear();
+    if (!s_available) return 999999;
+
+    // Deliberately NOT ff_reset_search_state(): get_1P_and_H is self-contained
+    // and doesn't touch the EHC/BFS hash tables that call resets -- see
+    // ff_api.h's doc comment on ff_estimate_heuristic for why skipping this
+    // (a real, measured cost on every call) is safe here.
+    std::vector<uint64_t> extended = build_extended_bitset(concrete_state);
+
+    // Sized to s_num_ops (== problem.actions.size() at the most recent
+    // build(), see its own doc comment) so ff_estimate_heuristic never
+    // truncates gH -- gnum_H can't exceed FF's own loaded operator count.
+    std::vector<int> helpful(static_cast<size_t>(s_num_ops));
+    int num_helpful = 0;
+    int h = ff_estimate_heuristic(extended.data(), helpful.data(), s_num_ops, &num_helpful);
+    if (h < 0) return 999999; // FF's own INFINITY sentinel
+
+    helpful.resize(static_cast<size_t>(num_helpful));
+    out_helpful_action_ids = std::move(helpful);
+    return h;
 }
 
 } // namespace CPOR

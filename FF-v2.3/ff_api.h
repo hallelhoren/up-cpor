@@ -57,6 +57,32 @@ int ff_load_problem(
     int num_goal_facts, const int* goal_facts
 );
 
+/*
+ * Cheap heuristic-only entry point: computes h(state) via a SINGLE relaxed-
+ * planning-graph fixpoint build (relax.c's get_1P_and_H), the same primitive
+ * FF's own enforced-hill-climbing driver calls internally at every node it
+ * visits -- without running do_enforced_hill_climbing/do_best_first_search's
+ * full real search out to the goal the way ff_search() does. Also returns
+ * FF's own "helpful actions" set: the applicable, zero-cost-in-the-relaxation
+ * operators achieving a level-1 subgoal, exactly what EHC itself uses to
+ * avoid ever expanding every applicable action from a state.
+ *
+ * Safe to call repeatedly with no ff_reset_search_state() in between --
+ * get_1P_and_H is self-contained (build_fixpoint/extract_1P/reset_fixpoint
+ * all run within this one call; collect_H_info clears its own previous
+ * is_in_H flags at its own start) -- exactly how FF's own EHC driver already
+ * calls it back-to-back in a tight loop with no reset between calls.
+ *
+ * out_helpful_actions must have room for at least max_helpful_actions ints;
+ * *out_num_helpful is set to how many were actually written (<= gnum_op_conn,
+ * so sizing the buffer to the problem's own action count is always enough).
+ * Returns h(state), or -1 (FF's own INFINITY sentinel) if the goal is
+ * unreachable from state in the delete-relaxed problem.
+ */
+int ff_estimate_heuristic(const uint64_t* determinized_state_bitset,
+                           int* out_helpful_actions, int max_helpful_actions,
+                           int* out_num_helpful);
+
 #ifdef __cplusplus
 }
 #endif

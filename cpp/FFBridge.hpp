@@ -68,6 +68,24 @@ public:
     // to the goal, or empty if FF found none.
     static std::vector<int> search(const PartiallySpecifiedState& concrete_state);
 
+    // Cheap heuristic-only counterpart to search(): a SINGLE relaxed-planning-
+    // graph fixpoint build (FF's own get_1P_and_H, the same primitive its EHC
+    // driver calls at every node it visits) instead of a full EHC/best-first
+    // search out to the goal. Returns h(concrete_state) (999999 if the goal
+    // is unreachable in the delete-relaxed problem, matching
+    // CPORSolver::score_concrete_sample's existing dead-state sentinel), and
+    // fills out_helpful_action_ids with FF's own "helpful actions" -- the
+    // small subset of applicable actions that actually make level-1 progress
+    // toward the goal in the relaxation, exactly what FF's EHC uses instead
+    // of scoring every applicable action individually. The returned ids are
+    // ordinary action.id values (FF's internal operator index space is
+    // identical to problem.actions' own indexing -- see build()'s Pass 1,
+    // which pushes ops in problem.actions' own iteration order with no
+    // renumbering), directly usable as ProblemDef::actions indices with no
+    // translation.
+    static int estimate_heuristic(const PartiallySpecifiedState& concrete_state,
+                                    std::vector<int>& out_helpful_action_ids);
+
 private:
     static bool s_available;
     static int s_total_predicates;
@@ -76,6 +94,16 @@ private:
     // "not-P" shadow fact (>= s_total_predicates).
     static std::vector<int> s_shadow_fact_of;
     static int s_num_ff_facts;
+    // problem.actions.size() at the most recent build() -- the upper bound
+    // on how many helpful-action ids ff_estimate_heuristic could ever report
+    // (gnum_H can't exceed FF's own loaded operator count), so
+    // estimate_heuristic() sizes its output buffer to this instead of
+    // guessing or truncating.
+    static int s_num_ops;
+
+    // Shared by search() and estimate_heuristic(): the original determinized
+    // facts, plus each negated-somewhere predicate's derived "not-P" shadow bit.
+    static std::vector<uint64_t> build_extended_bitset(const PartiallySpecifiedState& concrete_state);
 };
 
 } // namespace CPOR
