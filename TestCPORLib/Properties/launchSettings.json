@@ -1,8 +1,0 @@
-{
-  "profiles": {
-    "TestCPORLib": {
-      "commandName": "Project",
-      "commandLineArgs": "\"..\\..\\..\\..\\Tests\\doors5\\d.pddl\"\r\n\"..\\..\\..\\..\\Tests\\doors5\\p.pddl\"\r\n\"..\\..\\..\\..\\Tests\\doors5\\out.txt\""
-    }
-  }
-}
