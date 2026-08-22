@@ -6,6 +6,7 @@
 #include <limits>
 #include <cmath>
 #include <unordered_map>
+#include <utility>
 #include "ProblemData.hpp"
 
 /**
@@ -13,18 +14,26 @@
  * @brief Remembers that a fact went unknown because a conditional effect's
  * condition was itself unknown at apply time (ActionApplier's "Knowledge
  * Loss" rule) -- so that a LATER direct observation of that fact can be
- * abduced backward into the condition fact. Scoped to single-fact
- * (optionally negated) conditions only; see ActionApplier::apply_action.
+ * abduced backward into the condition. Supports multi-literal AND
+ * conditions (see ActionApplier::extract_flat_and_conjunction): OR/EQUALS/
+ * ONEOF conditions, or a NOT applied to more than one literal, still aren't
+ * representable and simply never populate this struct.
+ *
+ * unknown_literals holds only the condition's literals that were THEMSELVES
+ * still unknown at apply time (fact_id, required_value: true means the
+ * literal reads the fact directly, false means it reads NOT fact) --
+ * already-resolved literals aren't stored, since AND evaluating VAL_UNKNOWN
+ * guarantees every OTHER literal was already true (see Evaluator's AND
+ * semantics: false wins immediately, so VAL_UNKNOWN with no false operand
+ * means everything resolved so far agreed).
  */
 struct ConditionalProvenance {
-    int condition_fact_id{-1};
+    std::vector<std::pair<int, bool>> unknown_literals;
     bool effect_value{false};
-    bool condition_negated{false};
 
     bool operator==(const ConditionalProvenance& other) const {
-        return condition_fact_id == other.condition_fact_id &&
-               effect_value == other.effect_value &&
-               condition_negated == other.condition_negated;
+        return unknown_literals == other.unknown_literals &&
+               effect_value == other.effect_value;
     }
 };
 
@@ -170,33 +179,58 @@ public:
     if (!pending_provenance.empty()) pending_provenance.erase(id);
 }
 
-    // Records that `effect_fact_id` would become `effect_value` if
-    // `condition_fact_id` turns out (or, if `condition_negated`, turns out
-    // NOT) to be true -- called by ActionApplier right after set_unknown()
-    // degrades `effect_fact_id` because its conditional effect's condition
-    // was itself unknown. Overwrites any prior entry for the same fact.
-    void record_conditional_provenance(int effect_fact_id, int condition_fact_id, bool effect_value, bool condition_negated = false) {
-        pending_provenance[effect_fact_id] = ConditionalProvenance{condition_fact_id, effect_value, condition_negated};
+    // Records that `effect_fact_id` would become `effect_value` if every
+    // literal in `unknown_literals` turns out to hold (each interpreted per
+    // its own required_value flag -- see ConditionalProvenance) -- called by
+    // ActionApplier right after set_unknown() degrades `effect_fact_id`
+    // because its conditional effect's condition was itself unknown.
+    // Overwrites any prior entry for the same fact. No-op (nothing
+    // recorded) if `unknown_literals` is empty -- mirrors the old
+    // single-literal code's `trackable=false` case.
+    void record_conditional_provenance(int effect_fact_id, std::vector<std::pair<int, bool>> unknown_literals, bool effect_value) {
+        if (unknown_literals.empty()) return;
+        pending_provenance[effect_fact_id] = ConditionalProvenance{std::move(unknown_literals), effect_value};
     }
 
-    // Scoped regression fix: abduces a conditional effect's condition fact
-    // from a LATER direct observation of its (previously knowledge-loss-
-    // unknown) effect fact -- e.g. sensing `stainp(sK)` lets the engine
-    // deduce `ill(iK)` in medpks-style diagnosis domains, which the
-    // "Knowledge Loss" rule in ActionApplier alone can never recover.
+    // Scoped regression fix: abduces a conditional effect's condition
+    // literals from a LATER direct observation of its (previously
+    // knowledge-loss-unknown) effect fact -- e.g. sensing `stainp(sK)` lets
+    // the engine deduce `ill(iK)` in medpks-style diagnosis domains, or
+    // (the multi-literal case) sensing a `checking`-style effect in
+    // localize5-style localization domains lets it deduce its own hidden
+    // position from a 2+-literal `(not ok) AND at(X)`-shaped condition,
+    // neither of which the "Knowledge Loss" rule in ActionApplier alone can
+    // ever recover.
     //
-    // Deliberately one-directional: only effect-observed -> condition-
-    // deduced, never the reverse (condition-becomes-known -> forward-
-    // resolve effect). The condition fact may be a static hidden trait (as
-    // in diagnosis domains) or a fluent a later action legitimately
-    // changes, and this engine has no way to tell the two apart -- forward-
-    // resolving from a *later* known condition value would silently assume
-    // "static," which is unsound for the dynamic case. Call only at genuine
-    // observation sites (sensing), where the just-learned fact is known to
-    // reflect the world's ground truth, not an internal derivation.
+    // Two cases, both derived from AND's 3-valued semantics (false wins
+    // immediately, so a VAL_UNKNOWN condition guarantees every literal NOT
+    // in unknown_literals was already true when this was recorded):
+    //   - observed == effect_value: the whole conjunction was TRUE, so
+    //     EVERY still-unknown literal must have held -- deduce all of them
+    //     at once. Always resolvable, however many literals are pending.
+    //   - observed != effect_value: the conjunction was FALSE, i.e. at
+    //     least one pending literal was false -- a disjunction over
+    //     unknown_literals. Only resolvable outright when exactly one
+    //     literal was pending (then it must be the false one); with two or
+    //     more, which one is responsible is genuinely ambiguous, so no
+    //     deduction is made rather than guessing (full disjunctive-clause
+    //     tracking/unit-propagation across independently-resolving literals
+    //     is out of scope here -- this simply forgoes that narrower
+    //     opportunity, never risking an unsound guess).
     //
-    // Loops to a fixpoint since resolving one condition fact can itself be
-    // the effect fact of an earlier, still-pending provenance entry
+    // Deliberately one-directional otherwise: only effect-observed ->
+    // condition-deduced, never the reverse (condition-becomes-known ->
+    // forward-resolve effect). A condition literal's fact may be a static
+    // hidden trait (as in diagnosis domains) or a fluent a later action
+    // legitimately changes, and this engine has no way to tell the two
+    // apart -- forward-resolving from a *later* known condition value would
+    // silently assume "static," which is unsound for the dynamic case. Call
+    // only at genuine observation sites (sensing), where the just-learned
+    // fact is known to reflect the world's ground truth, not an internal
+    // derivation.
+    //
+    // Loops to a fixpoint since resolving one condition literal can itself
+    // be the effect fact of an earlier, still-pending provenance entry
     // (chained diagnosis). Cheap no-op whenever pending_provenance is empty
     // (the common case for domains without this pattern).
     bool apply_provenance_deductions() {
@@ -213,11 +247,18 @@ public:
                 }
                 ConditionalProvenance prov = it->second;
                 it = pending_provenance.erase(it);
-                if (is_unknown(prov.condition_fact_id)) {
-                    bool observed = is_true(effect_fact_id);
-                    bool condition_was_true = (observed == prov.effect_value);
-                    bool deduced_condition = prov.condition_negated ? !condition_was_true : condition_was_true;
-                    set_known_value(prov.condition_fact_id, deduced_condition);
+                bool observed = is_true(effect_fact_id);
+                if (observed == prov.effect_value) {
+                    for (const auto& lit : prov.unknown_literals) {
+                        if (is_unknown(lit.first)) {
+                            set_known_value(lit.first, lit.second);
+                        }
+                    }
+                } else if (prov.unknown_literals.size() == 1) {
+                    const auto& lit = prov.unknown_literals[0];
+                    if (is_unknown(lit.first)) {
+                        set_known_value(lit.first, !lit.second);
+                    }
                 }
                 changed = true;
                 any_changed = true;
@@ -347,9 +388,11 @@ struct StateHasher {
         for (const auto& kv : s.pending_provenance) {
             std::size_t entry_seed = 0;
             hash_combine(entry_seed, std::hash<int>{}(kv.first));
-            hash_combine(entry_seed, std::hash<int>{}(kv.second.condition_fact_id));
+            for (const auto& lit : kv.second.unknown_literals) {
+                hash_combine(entry_seed, std::hash<int>{}(lit.first));
+                hash_combine(entry_seed, std::hash<bool>{}(lit.second));
+            }
             hash_combine(entry_seed, std::hash<bool>{}(kv.second.effect_value));
-            hash_combine(entry_seed, std::hash<bool>{}(kv.second.condition_negated));
             provenance_seed ^= entry_seed;
         }
         hash_combine(seed, provenance_seed);

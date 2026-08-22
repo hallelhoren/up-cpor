@@ -3,8 +3,10 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
+#include <chrono>
 #include "ProblemData.hpp"
 #include "Evaluator.hpp"
+#include "DebugStats.hpp"
 
 namespace CPOR {
 
@@ -68,7 +70,18 @@ public:
 
     // Initializes the context once per problem (call invalidate() first if a
     // different problem was previously loaded in this thread).
-    void initialize(const ProblemDef& problem) {
+    //
+    // assert_deadends controls whether known dead-end formulas get baked in
+    // as permanent depth-0 axioms (see step 3 below) -- true for the witness
+    // -sampling use case this was originally built for, but it must be false
+    // for a Z3Manager instance used for general entailment queries (see
+    // formula_is_entailed): baking in "this dead-end formula is impossible"
+    // as an axiom makes any later query asking "is this dead-end formula
+    // false, given the CURRENT belief" a tautology -- true regardless of
+    // what the belief actually says -- which is exactly backwards for a
+    // caller trying to determine whether a *specific* belief has actually
+    // ruled a dead-end out. See g_z3_entailment_manager's own comment.
+    void initialize(const ProblemDef& problem, bool assert_deadends = true) {
         if (is_initialized) return;
 
         fluent_vars.reserve(problem.total_predicates);
@@ -86,9 +99,11 @@ public:
         // mathematically valid if it does NOT satisfy any known dead-end condition.
         // Without this, sampled witnesses could land in states the engine already
         // knows are unsolvable, corrupting the heuristic and wasting search effort.
-        for (const auto& deadend_rpn : problem.deadend_rpns) {
-            if (deadend_rpn.empty()) continue;
-            solver.add(!rpn_to_z3(deadend_rpn));
+        if (assert_deadends) {
+            for (const auto& deadend_rpn : problem.deadend_rpns) {
+                if (deadend_rpn.empty()) continue;
+                solver.add(!rpn_to_z3(deadend_rpn));
+            }
         }
 
         is_initialized = true;
@@ -152,6 +167,93 @@ public:
             }
         }
     }
+
+    // Checks whether `rpn` is logically ENTAILED by `belief`'s known facts
+    // together with the oneof groups still relevant to `belief` (see
+    // assert_relevant_oneofs) -- i.e. whether belief + NOT(rpn) is
+    // UNSATISFIABLE. Deliberately does NOT bake in the problem's dead-end
+    // formulas as axioms the way sample_concrete_states does -- see this
+    // method's initialize() call and g_z3_entailment_manager's own comment
+    // for why that would make dead-end-adjacent queries vacuous.
+    //
+    // This is a strictly more capable alternative to Evaluator::evaluate for
+    // formulas whose truth only follows once a domain invariant is factored
+    // in: a flat, invariant-blind three-valued evaluation has no notion of
+    // "these five room-identity facts are mutually exclusive," so it can
+    // never resolve a regressed disjunction like the one
+    // RegressionEngine::regress_rpn now builds when a token is gated by
+    // several still-unresolved conditional effects (e.g. a localization
+    // domain's per-room `checking` conditions) -- Z3 can, because the same
+    // oneof invariant that already drives witness sampling is asserted here
+    // too. Uses the same push()/assert/check()/pop() scoping already proven
+    // safe by sample_concrete_states, so a query's assertions never leak
+    // into the next one.
+    // extra_constraints (default empty): additional RPN formulas asserted
+    // alongside `belief`'s own known facts -- see
+    // BeliefState::verify_condition_safely for why this matters: `rpn` alone
+    // only captures what regressing the TARGET query implies, which is a
+    // no-op for any token an observation never directly modified (e.g. a
+    // hidden identity fact like `at(room)` that only sensing actions'
+    // *effects on other facts* constrain, never write to directly). What was
+    // actually LEARNED from each observation along the way has to be
+    // regressed to the initial state in its own right and fed in here, or
+    // it never influences this check at all.
+    bool formula_is_entailed(const std::vector<int>& rpn, const PartiallySpecifiedState& belief, const ProblemDef& problem,
+                              const std::vector<std::vector<int>>& extra_constraints = {}) {
+        if (rpn.empty()) return true;
+        // false: this instance must NOT carry the "known dead-ends are
+        // impossible" axioms sample_concrete_states relies on -- see this
+        // method's own initialize() overload comment for why baking those in
+        // here would make dead-end-adjacent entailment queries vacuous.
+        initialize(problem, /*assert_deadends=*/false);
+
+        solver.push();
+        assert_relevant_oneofs(belief, problem);
+        for (int i = 0; i < problem.total_predicates; ++i) {
+            if (!belief.is_unknown(i)) {
+                if (belief.is_true(i)) solver.add(fluent_vars[i]);
+                else solver.add(!fluent_vars[i]);
+            }
+        }
+        for (const auto& constraint_rpn : extra_constraints) {
+            if (!constraint_rpn.empty()) solver.add(rpn_to_z3(constraint_rpn));
+        }
+        solver.add(!rpn_to_z3(rpn));
+        auto __dbg_t0 = DebugStats::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        z3::check_result result = solver.check();
+        if (DebugStats::enabled()) {
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __dbg_t0).count();
+            DebugStats::record_z3_call(ms);
+        }
+        solver.pop();
+
+        // UNSAT means belief's known facts + invariants are logically
+        // incompatible with the formula being false -- i.e. the formula must
+        // be true. SAT (a counterexample exists) or UNKNOWN (Z3 gave up) both
+        // mean entailment isn't proven; treated the same, conservatively, as
+        // "can't conclude true" -- never a false positive.
+        return result == z3::unsat;
+    }
 };
+
+// Shared, thread-local Z3 context/solver for witness sampling
+// (SDRSampler::sample_concrete_states): lock-free (each thread owns its own
+// instance), initialized WITH the known-dead-ends-are-impossible axioms
+// (initialize()'s default assert_deadends=true) -- exactly what sampling
+// needs so it never proposes a witness that's already a confirmed dead end.
+inline thread_local Z3Manager g_z3_manager;
+
+// Separate thread-local instance for general logical-entailment queries
+// (BeliefState::verify_condition_safely's Z3 fallback -- see
+// formula_is_entailed). Deliberately NOT the same instance as g_z3_manager:
+// that one bakes dead-end formulas in as permanent axioms, which is correct
+// for filtering sample witnesses but would make any entailment query
+// touching a dead-end formula (e.g. "is this dead-end false, given the
+// current belief") vacuously true regardless of the belief -- exactly
+// backwards for a caller trying to determine whether a *specific* belief has
+// actually ruled a dead-end out. Kept as its own instance (rather than a
+// runtime toggle on g_z3_manager) so a query on one can never accidentally
+// observe axioms baked in by the other, whichever gets initialized first.
+inline thread_local Z3Manager g_z3_entailment_manager;
 
 } // namespace CPOR
