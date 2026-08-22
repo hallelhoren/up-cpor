@@ -49,3 +49,9 @@ target_link_libraries(test_integration PRIVATE cpor_core z3)
 
 add_executable(test_sdr_full_lifecycle tests/test_sdr_full_lifecycle.cpp)
 target_link_libraries(test_sdr_full_lifecycle PRIVATE cpor_core z3)
+
+add_executable(test_regression_scratch tests/test_regression_scratch.cpp)
+target_link_libraries(test_regression_scratch PRIVATE cpor_core z3)
+
+add_executable(test_bmc_scratch tests/test_bmc_scratch.cpp)
+target_link_libraries(test_bmc_scratch PRIVATE cpor_core z3)
