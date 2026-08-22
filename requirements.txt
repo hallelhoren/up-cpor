@@ -1,0 +1,9 @@
+# currently, the latest unified_planning release does not include PR 707,
+# which up-cpor's contingent-planning support depends on:
+# https://github.com/aiplan4eu/unified-planning/pull/707
+unified-planning @ git+https://github.com/aiplan4eu/unified-planning@fa635c0fb4debb47f22c5bd1af4dc2559be861fa
+pysmt
+z3-solver
+pytest
+up-tamer
+up-pyperplan

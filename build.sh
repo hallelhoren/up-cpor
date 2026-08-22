@@ -1,25 +1,18 @@
 #!/bin/bash
+set -e
 
 echo "=================================="
-echo "1. Building C# CPORLib..."
+echo "1. Building C++ Native Core..."
 echo "=================================="
-dotnet build CPORLib/CPORLibSolution.sln
-
-echo "=================================="
-echo "2. Building C++ Native Core..."
-echo "=================================="
-# יצירת תיקיית build זמנית בתוך cpp/
 mkdir -p cpp/build
 cd cpp/build
-# יצירת ההוראות לקימפול והרצת הקומפיילר
 cmake ..
-make
-# העתקת התוצר המקומפל (.so) לתיקיית השורש כדי שהפייתון ימצא אותו בקלות
+make -j"$(nproc)"
+# Copy the compiled shared library to the repo root so Python can find it.
 cp libcpor_core.so ../../
 cd ../..
 
 echo "=================================="
-echo "3. Installing Python Package..."
+echo "2. Installing Python Package..."
 echo "=================================="
-#pip uninstall -y up-cpor
-#pip install -e .
+pip install -e .
