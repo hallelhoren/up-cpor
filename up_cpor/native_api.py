@@ -84,6 +84,16 @@ cpor_lib.sdr_apply_observation.argtypes = [ctypes.c_bool]
 cpor_lib.sdr_apply_observation.restype = ctypes.c_bool
 cpor_lib.sdr_session_destroy.argtypes = []
 cpor_lib.sdr_session_destroy.restype = None
+cpor_lib.sim_session_init.argtypes = []
+cpor_lib.sim_session_init.restype = ctypes.c_bool
+cpor_lib.sim_apply_action.argtypes = [ctypes.c_int]
+cpor_lib.sim_apply_action.restype = ctypes.c_bool
+cpor_lib.sim_get_fact_value.argtypes = [ctypes.c_int]
+cpor_lib.sim_get_fact_value.restype = ctypes.c_int
+cpor_lib.sim_is_goal_reached.argtypes = []
+cpor_lib.sim_is_goal_reached.restype = ctypes.c_bool
+cpor_lib.sim_session_destroy.argtypes = []
+cpor_lib.sim_session_destroy.restype = None
 cpor_lib.get_chosen_action.argtypes = [ctypes.c_int]
 cpor_lib.get_chosen_action.restype = ctypes.c_int
 cpor_lib.get_node_is_solved.argtypes = [ctypes.c_int]
@@ -233,6 +243,41 @@ def sdr_apply_observation(value: bool) -> bool:
 
 def sdr_session_destroy() -> None:
     cpor_lib.sdr_session_destroy()
+
+def sim_session_init() -> bool:
+    """Starts a fresh native execution-environment simulator over the problem
+    most recently loaded via load_problem_to_cpp -- the native backing for
+    up_cpor.simulator.SDRSimulator. Samples one fully concrete, oneof-consistent
+    ground-truth world (via SDRSampler/Z3) and makes it that simulator's state.
+    Returns False if the problem's initial belief has no logically consistent
+    concrete resolution at all (a malformed/contradictory oneof setup)."""
+    return bool(cpor_lib.sim_session_init())
+
+def sim_apply_action(action_id: int) -> bool:
+    """Checks action_id's precondition against the simulator's ground truth
+    and, if satisfied, applies its effects to it. Returns False (ground truth
+    left untouched) if the action isn't actually applicable there -- mirrors
+    unified_planning's own SimulatedExecutionEnvironment.apply() rejecting an
+    inapplicable action, so callers can raise the same kind of error either
+    simulator would."""
+    return bool(cpor_lib.sim_apply_action(action_id))
+
+def sim_get_fact_value(fact_id: int) -> int:
+    """Reads fact_id's truth value out of the simulator's current ground
+    truth: 1 (true), 0 (false), or -1 (no active session / out-of-range
+    fact_id -- SDRSampler guarantees every fact is resolved in a sampled
+    concrete state, so -1 should never occur for a valid fact_id otherwise).
+    Called right after a successful sim_apply_action() of a sensing action to
+    read back the fact it just observed."""
+    return cpor_lib.sim_get_fact_value(fact_id)
+
+def sim_is_goal_reached() -> bool:
+    """Evaluates the problem's goal formula against the simulator's current
+    ground truth."""
+    return bool(cpor_lib.sim_is_goal_reached())
+
+def sim_session_destroy() -> None:
+    cpor_lib.sim_session_destroy()
 
 def get_chosen_action(node_idx: int) -> int:
     return cpor_lib.get_chosen_action(node_idx)

@@ -6,6 +6,7 @@
 #include "FFBridge.hpp"
 #include "SDRSampler.hpp"
 #include "DeadEndManager.hpp"
+#include "DebugStats.hpp"
 #include <vector>
 #include <iostream>
 #include <unordered_set>
@@ -109,7 +110,8 @@ extern "C" {
     void print_problem_stats() {
         std::cout << "=== C++ Native Memory Verification ===" << std::endl;
         std::cout << "Total Predicates: " << get_global_problem().total_predicates << std::endl;
-        std::cout << "Initial Facts: " << get_global_problem().initial_true_facts.size() << std::endl;
+        std::cout << "Initial Facts: " << get_global_problem().initial_true_facts.size()
+                  << " true, " << get_global_problem().initial_false_facts.size() << " false" << std::endl;
         std::cout << "Actions Loaded: " << get_global_problem().actions.size() << std::endl;
         std::cout << "======================================" << std::endl;
     }
@@ -282,6 +284,7 @@ extern "C" {
             std::cout << "Total Universes Explored (Node Count): " << global_solver->get_node_count() << std::endl;
         }
         std::cout << "Layered fallback (Option 1) invocations this solve: " << global_solver->get_fallback_invocation_count() << std::endl;
+        CPOR::DebugStats::print_summary();
         return success;
     }
 
@@ -360,6 +363,106 @@ extern "C" {
             global_sdr_session = nullptr;
         }
     }
+
+    // =====================================================================
+    // NATIVE EXECUTION-ENVIRONMENT SIMULATOR (native backing for
+    // up_cpor.simulator.SDRSimulator, the Python restoration of the
+    // README's "SDR Engine - with SDR Simulated Environment" usage pattern
+    // -- previously backed entirely by the legacy C# CPORLib.PlanningModel.Simulator
+    // via pythonnet, now removed). Distinct from the SDR SESSION above: that
+    // one is the *planner*'s own incremental belief tracking (what SDRImpl
+    // thinks is true); this one is the *environment*'s single, fully-resolved
+    // ground truth (what's actually true), exactly the same conceptual split
+    // unified_planning's own SimulatedExecutionEnvironment makes between the
+    // planner under test and the environment driving it. Reuses
+    // ActionApplier (the same deterministic effect-application logic
+    // CPORSolver/SDRPlanner already trust) and SDRSampler (the same Z3-backed
+    // oneof-consistent sampling CPOR's own OnlinePlan witness generation
+    // already trusts) rather than introducing a second implementation of
+    // either.
+    // =====================================================================
+    PartiallySpecifiedState* global_sim_ground_truth = nullptr;
+
+    // Samples exactly one fully concrete (every fact known) world consistent
+    // with the current problem's initial belief and oneof constraints, and
+    // makes it the simulator's ground truth. Must be called after the
+    // problem is fully loaded (init_problem() plus every add_*/create_action
+    // call), mirroring sdr_session_init()'s own contract.
+    bool sim_session_init() {
+        if (global_sim_ground_truth) {
+            delete global_sim_ground_truth;
+            global_sim_ground_truth = nullptr;
+        }
+
+        PartiallySpecifiedState initial_belief = build_owa_initial_state();
+        auto samples = CPOR::SDRSampler::sample_concrete_states(initial_belief, get_global_problem(), 1);
+        if (samples.empty()) {
+            // The initial belief has no logically consistent concrete
+            // resolution at all (a malformed/contradictory oneof setup) --
+            // nothing meaningful to simulate. Report failure rather than
+            // leaving global_sim_ground_truth null for later calls to
+            // silently misbehave against.
+            return false;
+        }
+        global_sim_ground_truth = new PartiallySpecifiedState(samples[0]);
+        return true;
+    }
+
+    // Checks action_id's precondition against the concrete ground truth (a
+    // fully-resolved state, so PESSIMISTIC/OPTIMISTIC/EXACT all agree) and,
+    // if satisfied, applies its effects to it. Returns false (ground truth
+    // left untouched) if the action's precondition doesn't actually hold --
+    // exactly the same "reject an inapplicable action" contract
+    // unified_planning's own SimulatedExecutionEnvironment.apply() has, so
+    // Python can raise the same UPUsageError either simulator would.
+    bool sim_apply_action(int action_id) {
+        if (!global_sim_ground_truth) return false;
+        const ProblemDef& problem = get_global_problem();
+        if (action_id < 0 || static_cast<size_t>(action_id) >= problem.actions.size()) return false;
+
+        const GroundedAction& action = problem.actions[action_id];
+        if (!Evaluator::evaluate(action.precondition_rpn, *global_sim_ground_truth, EvalMode::PESSIMISTIC)) {
+            return false;
+        }
+
+        try {
+            ActionApplier::apply_action(action, *global_sim_ground_truth);
+        } catch (const std::exception&) {
+            // See sdr_get_next_action's identical guard: never let a
+            // malformed-RPN exception cross the extern "C" boundary.
+            return false;
+        }
+        return true;
+    }
+
+    // Reads fact_id's truth value out of the CURRENT ground truth -- called
+    // by Python right after a successful sim_apply_action() of a sensing
+    // action, to read back the fact it just observed. 1/0 for known
+    // true/false; -1 is defensive only (SDRSampler guarantees every fact is
+    // resolved in a sampled concrete state, so this should never actually
+    // fire in practice) and also covers "no active session"/an out-of-range
+    // fact_id.
+    int sim_get_fact_value(int fact_id) {
+        if (!global_sim_ground_truth) return -1;
+        if (fact_id < 0) return -1;
+        if (global_sim_ground_truth->is_true(fact_id)) return 1;
+        if (global_sim_ground_truth->is_false(fact_id)) return 0;
+        return -1;
+    }
+
+    // Evaluates the problem's goal formula against the current ground truth.
+    bool sim_is_goal_reached() {
+        if (!global_sim_ground_truth) return false;
+        return Evaluator::evaluate(get_global_problem().goal_rpn, *global_sim_ground_truth, EvalMode::PESSIMISTIC);
+    }
+
+    void sim_session_destroy() {
+        if (global_sim_ground_truth) {
+            delete global_sim_ground_truth;
+            global_sim_ground_truth = nullptr;
+        }
+    }
+
     // =====================================================================
     // PLAN EXTRACTION GETTERS FOR PYTHON
     // =====================================================================
