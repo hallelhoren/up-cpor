@@ -17,12 +17,21 @@ public:
      * @param current_belief The Dual-Mask state containing UNKNOWN bits.
      * @param global_problem The problem definition containing OneOf invariants.
      * @param target_sample_count The maximum number of diverse concrete states to generate.
+     * @param extra_constraints Optional additional RPN formulas asserted alongside
+     * `current_belief`'s own known facts and the problem's oneof invariants --
+     * see BeliefState::derive_learned_constraints. Lets a caller with a full
+     * history (unlike this flat belief snapshot) make sampled witnesses
+     * respect everything that history's own observations already imply,
+     * even for facts the belief's bitset never resolved directly (e.g. a
+     * hidden position only ever observed through its side effects).
+     * Empty by default, so every existing caller's behavior is unchanged.
      * @return A vector of PartiallySpecifiedStates where ALL bits are fully resolved (known_mask is completely filled).
      */
     static std::vector<PartiallySpecifiedState> sample_concrete_states(
         const PartiallySpecifiedState& current_belief,
         const ProblemDef& global_problem,
-        int target_sample_count
+        int target_sample_count,
+        const std::vector<std::vector<int>>& extra_constraints = {}
     );
 
     /**
