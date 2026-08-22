@@ -6,6 +6,7 @@
 #include <iostream>
 #include <limits>
 #include <new>
+#include <optional>
 
 #include "State.hpp"
 #include "Evaluator.hpp"
@@ -15,6 +16,7 @@
 #include "ActionApplier.hpp"
 #include "SDRPlanner.hpp"
 #include "BeliefState.hpp"
+#include "Z3BMCManager.hpp"
 
 namespace CPOR { 
 
@@ -50,6 +52,21 @@ struct PlanNode {
     std::vector<int> relevant_hidden{};
     bool has_relevance{false};
 
+    // Witness continuity for the offline OnlinePlan sub-search (mirrors
+    // SDRPlanner's own guide_witness_/has_guide_witness_ for the online
+    // instance path -- see SDRPlanner::compute_linear_plan's header comment
+    // for the exact bug this closes): the single fully-concrete hidden-state
+    // hypothesis this node inherited from its parent, already progressed via
+    // ActionApplier through every action on the path from the root to here.
+    // Threaded parent-to-child by solve_cpor_loop at every point a child
+    // node is created; false/default whenever no witness has been
+    // established yet for this node's own history (e.g. the root, or a
+    // sensing child whose branch contradicts the parent's witness), which
+    // simply means the next compute_linear_plan call for this node samples
+    // fresh, exactly like before this mechanism existed.
+    bool has_guide_witness{false};
+    PartiallySpecifiedState guide_witness;
+
     PlanNode(const PartiallySpecifiedState& s, int act_id) : state(s), action_id(act_id) {}
 };
 
@@ -69,6 +86,35 @@ private:
     // the "Plan Graph Compaction" section below for the full mechanism.
     std::vector<int> closed_registry;
 
+    // Persistent, tree-indexed BMC cache shared by solve_from_node's rescue path and
+    // its branch-admissibility check (see Z3BMCManager's own doc comment) -- spans
+    // the WHOLE solve, not just one solve_from_node call, so a node's encoding is
+    // built at most once ever, regardless of how many different candidates or
+    // descendants end up needing it. Lazily constructed (needs total_predicates,
+    // which isn't necessarily known yet at CPORSolver's own construction time).
+    std::optional<Z3BMCManager> tree_bmc;
+    // Ensures node_idx (and any of its ancestors not yet cached) has a tree_bmc
+    // entry, recursing toward the root exactly like get_node_learned_constraints
+    // used to for the forward direction. Needed because solve_from_node's fallback
+    // can be invoked deep inside a subtree solve_cpor_loop's own online loop built
+    // -- node_idx's ancestors were never "visited via solve_from_node" at all, so a
+    // naive "build only what THIS call needs" would miss them; walking back to the
+    // nearest already-cached ancestor (or the root) fills exactly the gap, no more.
+    void ensure_node_bmc(int node_idx);
+
+    // Returns the position within current_path_indices whose node's belief state
+    // exactly equals `state` (an epistemic cycle), or -2 if none. Shared between
+    // solve_from_node's own top-of-function safety check (covers every entry
+    // point, including ones this pre-filter can't reach) and the OR-node
+    // candidate loop's pre-filter (an optimization: skip node_pool allocation +
+    // a full recursive solve_from_node call -- with its own BMC enter_node/
+    // exit_node overhead -- for a candidate action whose resulting state is
+    // trivially a cycle, since solve_from_node would immediately rediscover
+    // exactly this and return false anyway). Confirmed via CPOR_DEBUG_STATS that
+    // over half of ALL solve_from_node calls on localize5-tamer were cycle hits
+    // discovered this way, at full recursion cost, every single time.
+    int find_cycle_ancestor_position(const PartiallySpecifiedState& state, const std::vector<int>& current_path_indices) const;
+
     struct ActionCandidate {
         int action_idx;
         int h_score;
@@ -83,7 +129,30 @@ private:
     void expand_sensing_node(int node_idx, int action_id, int observe_fluent, const PartiallySpecifiedState& current_state);
     
     bool is_action_applicable(const GroundedAction& action, const PartiallySpecifiedState& state);
+    // Scores `state` directly -- no concrete sampling. A still-unknown fact is
+    // treated as not-yet-true (matches EvalMode::PESSIMISTIC, already used
+    // throughout BFSSolver/FFBridge's own is_true() checks): the mathematically
+    // correct delete-relaxation reading, since reachability must never be
+    // granted for free just because some arbitrary resolution of an unknown
+    // would have satisfied it. See score_concrete_sample's own doc comment for
+    // why this replaced the previous SDRSampler-based single-sample approach.
     int compute_heuristic(const PartiallySpecifiedState& state);
+    // The FF/bounded-BFS scoring half of compute_heuristic, factored out so a caller
+    // that already has its own concrete sample (e.g. the rescue path's BMC-produced
+    // one, see solve_from_node) can reuse it directly.
+    int score_concrete_sample(const PartiallySpecifiedState& sample, const ProblemDef& problem);
+    // AND-node-aware heuristic for a SENSING candidate: ActionApplier::apply_action
+    // is a no-op for a pure :observe action (it has no guaranteed/conditional
+    // effects), so compute_heuristic(projected_state) on its own is indistinguishable
+    // from "took no action at all" and can never show any improvement -- exactly
+    // the second half of the "heuristic is blind to sensing" bug (Tier 1's
+    // FFBridge fix alone only helps a DOWNSTREAM action's precondition become
+    // reachable; it does nothing for the sensing action's OWN candidate score).
+    // Scores both hypothetical outcomes (observe_fluent forced true / forced
+    // false, each re-closed via apply_oneof_deductions) and combines them as an
+    // AND-node: both branches genuinely need solving, so their costs sum, plus
+    // 1 for the sensing action itself.
+    int score_sensing_candidate(const PartiallySpecifiedState& state, int observe_fluent);
 
     // -------------------------------------------------------------------
     // CPOR outer-loop machinery (solve_cpor_loop and its helpers below)
@@ -133,12 +202,23 @@ private:
 
     // How many classical (non-sensing) actions find_resolving_sensing_action_via_prefix
     // is willing to chain before giving up on a "navigate-then-sense" resolution
-    // and letting the caller fall back to the exhaustive search instead. Kept
-    // small deliberately: this is a local, non-backtracking forward search (see
-    // its own comment), not a substitute for solve_from_node -- it should stay
-    // far cheaper than the fallback it's trying to avoid, not become a second
-    // source of combinatorial blowup.
-    static constexpr int MAX_SENSING_PREFIX_DEPTH = 3;
+    // and letting the caller fall back to the exhaustive search instead. Was 3
+    // -- confirmed via CPOR_DEBUG_STATS on doors15-tamer (a much bigger grid
+    // than the domains this was originally tuned against) that this was the
+    // actual bottleneck behind the C++ port's gap against the C# reference
+    // (which solves doors15 in ~9s/708 states vs. this port's tens of
+    // thousands of nodes and climbing): prefix_search_cut_off_depth=44 with
+    // prefix_search_exhausted=0 in one short run -- the depth cap was ALWAYS
+    // what stopped the search, never genuine exhaustion, meaning a resolver
+    // routinely exists just beyond depth 3 and every miss was forcing an
+    // entire subtree into the exponentially more expensive exhaustive
+    // fallback (solve_from_node) that C#'s stack-based algorithm never needs
+    // an equivalent of at all. MAX_VISITED_STATES below remains the real cost
+    // bound regardless of how deep this goes, so raising the depth ceiling
+    // doesn't turn this into a second source of combinatorial blowup -- it
+    // was simply an unnecessarily tight extra restriction on top of that
+    // budget.
+    static constexpr int MAX_SENSING_PREFIX_DEPTH = 30;
 
     // Extends find_resolving_sensing_action to cover sensing actions that
     // AREN'T applicable yet at `belief` but become applicable after a short
@@ -164,6 +244,20 @@ private:
     int find_resolving_sensing_action_via_prefix(const std::vector<int>& blocked_precondition_rpn,
                                                    const PartiallySpecifiedState& belief,
                                                    std::vector<int>& out_prefix_actions);
+
+    // Lazily-built, problem-wide bitmap: predicate_can_become_unknown_[p] is
+    // true iff SOME action anywhere in the domain lists p in its
+    // non_deterministic_effects -- the only effect kind that ever marks a
+    // fact UNKNOWN in this engine. Feeds find_resolving_sensing_action_via_prefix's
+    // upfront prune below: a predicate that's already known and can NEVER
+    // become unknown again (e.g. doors15's `opened`, purely observe-only,
+    // never any action's effect at all) can't be helped by chaining through
+    // MORE classical actions no matter how far the search goes, so there's
+    // no need to actually run that search. Computed once per CPORSolver
+    // instance (one per solve) and reused across every call, since it
+    // depends only on the static action set, never on any particular belief.
+    std::optional<std::vector<bool>> predicate_can_become_unknown_;
+    const std::vector<bool>& get_predicate_can_become_unknown(const ProblemDef& problem);
 
     // Attempts to turn a blocked/truncated action (blocking_action_id, as
     // surfaced by SDRPlanner::compute_linear_plan's out_blocking_action_id,
@@ -256,6 +350,23 @@ private:
     // means normal solving proceeds as before this mechanism existed).
     int find_closed_relevance_match(const PartiallySpecifiedState& belief) const;
 
+    // Reconstructs a full-history BeliefState for node_idx by walking
+    // parent_idx up to the root and replaying that chain forward via
+    // apply_forward_action -- the offline tree-building loop's equivalent of
+    // the online SDRPlanner instance's own persistent `belief` member, which
+    // it maintains incrementally for free. Needed so the same regression +
+    // Z3-entailment machinery available online (BeliefState::
+    // verify_condition_safely / derive_learned_constraints) can also see
+    // this node's actual observation history, not just its own flat belief
+    // snapshot -- solve_cpor_loop previously wrapped just the snapshot in a
+    // fresh, empty-history BeliefState, which made any regression fallback
+    // silently a no-op for every node but the root. A PlanNode's own
+    // `action_id` is exactly the action that produced its `state` from its
+    // parent's (see the PlanNode's own construction sites in CPORSolver.cpp
+    // and expand_sensing_node), so this needs no extra bookkeeping beyond
+    // what node_pool already stores.
+    BeliefState build_belief_state_for_node(int node_idx) const;
+
 public:
     CPORSolver() {
         node_pool.reserve(500000); // Pre-allocate Arena to avoid vector reallocation invalidating indices
@@ -283,11 +394,28 @@ public:
     //     still self-contained -- see solve_from_node's definition of NO_CYCLE). Must
     //     not be cached at this level; the caller propagates it further up via its own
     //     out_lowlink so the ancestor at position P can eventually resolve it.
-    //   - -1 is used for a depth-cap cutoff: a horizon limit, not a real cycle, so it
-    //     never satisfies "self-contained" at any node and permanently blocks caching
-    //     along the whole current path, exactly like the prior always-non-definitive
-    //     behavior for the depth cap specifically.
+    //   - -1 is used for a depth-cap cutoff (a horizon limit, not a real cycle) AND for
+    //     an AND-node branch resolved via tree_bmc's vacuous "provably impossible"
+    //     marking (see solve_from_node's AND-node branch for the full reasoning): both
+    //     depend on something solved_cache/failed_cache's flat-state key can't capture
+    //     (a search horizon position; node_idx's own ancestor history, respectively), so
+    //     neither ever satisfies "self-contained" at any node and both permanently block
+    //     caching along the whole current path.
     static constexpr int NO_CYCLE = std::numeric_limits<int>::max();
+    // Search-tree depth horizon: solve_from_node treats exceeding this as
+    // inconclusive (never cached as a real failure -- see NO_CYCLE's own doc
+    // comment on the -1 sentinel this produces). Was 50, then 150; raised again
+    // for doors15, a much larger-scale domain (450 predicates, 1680 actions)
+    // than anything this cap was originally tuned against. The 50->150 jump
+    // still left the ceiling binding (max_depth_seen=151, depth_cap_hits=15979
+    // of 104781 in one 300s run) -- but a depth_cap_h diagnostic (see
+    // DebugStats::record_depth_cap_h) proved the heuristic itself isn't the
+    // problem: depth_cap_h_avg=8.1, 73% of all depth-cap hits had h<10 and
+    // ZERO ever had h>=100 -- the search consistently arrives within striking
+    // distance of the goal and then runs out of room, never wanders. That's a
+    // clean signal to keep raising the ceiling rather than revisit the
+    // heuristic.
+    static constexpr int MAX_SEARCH_DEPTH = 400;
     bool solve_from_node(int node_idx, std::vector<int>& current_path_indices, int depth = 0, int* out_lowlink = nullptr);
 
     // Builds the plan tree using the stack-based CPOR outer loop (Maliah,

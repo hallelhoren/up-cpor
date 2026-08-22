@@ -1,11 +1,127 @@
 #include "CPORSolver.hpp"
 #include "FFBridge.hpp"
+#include "Regression.hpp"
+#include "DebugStats.hpp"
+#include <cstdlib>
+#include <iostream>
+#include <chrono>
 
 namespace CPOR {
+
+namespace {
+// RAII bracket for Z3BMCManager::enter_node/exit_node: guarantees exactly one
+// exit_node() per enter_node(), even when solve_from_node returns early (it has
+// many early-return paths -- depth cap, solved_cache/failed_cache hits, cycle
+// detection) or when an exception unwinds through it (fallback_to_exhaustive_search
+// catches std::bad_alloc from a runaway FF call; the destructor still fires
+// correctly during unwinding, keeping path_solver_'s push/pop stack balanced).
+// Also owns memory reclamation: once this node's own solve_from_node call
+// returns (this scope closes), its Z3BMCManager cache entry is freed --
+// see Z3BMCManager::evict's own doc comment for why this is always safe
+// (ensure_node_bmc transparently rebuilds a missing entry on any later
+// re-entry, from node_pool's own state, at a bounded, deterministic cost).
+// This is what actually bounds the search's Z3-side memory to roughly the
+// current active path plus whatever's still open, instead of the whole
+// search tree ever visited -- confirmed as the fix for doors15-tamer's
+// ~14GB cgroup OOM, which was accumulating exactly this: every closed
+// subtree's cached assertion vectors, held forever.
+//
+// A lazy-activation version of this (defer build+enter to the first actual
+// tree_bmc query) was tried and reverted: the goal-check below is
+// unconditional on every node for every domain, so it activates tree_bmc
+// immediately regardless -- lazy activation delivered no measured benefit
+// for doors15-tamer (the one domain it was meant to help) while adding real
+// complexity, so eager construction stays the simpler, equally-safe choice.
+struct BmcNodeScope {
+    Z3BMCManager& bmc;
+    int node_idx;
+    BmcNodeScope(Z3BMCManager& b, int idx, int parent_idx) : bmc(b), node_idx(idx) { bmc.enter_node(node_idx, parent_idx); }
+    ~BmcNodeScope() { bmc.exit_node(); bmc.evict(node_idx); }
+    BmcNodeScope(const BmcNodeScope&) = delete;
+    BmcNodeScope& operator=(const BmcNodeScope&) = delete;
+};
+
+// One-shot tracing for the specific question of WHY solve_cpor_loop's cheap
+// online loop gave up and reached for fallback_to_exhaustive_search -- gated
+// on CPOR_DEBUG_FALLBACK and capped at a handful of prints so a real run
+// stays readable instead of flooding with the same pattern hundreds of times.
+void trace_fallback_trigger(const char* reason, int node_idx, int depth,
+                             const PartiallySpecifiedState& belief, const ProblemDef& problem,
+                             int blocking_action_id, const std::vector<int>* blocking_fact_tokens) {
+    static int remaining = std::getenv("CPOR_DEBUG_FALLBACK") ? 6 : 0;
+    if (remaining <= 0) return;
+    --remaining;
+    std::cerr << "[DBG-FALLBACK] reason=" << reason << " node_idx=" << node_idx << " depth=" << depth << "\n";
+    if (blocking_action_id != -1) {
+        const GroundedAction& a = problem.actions[blocking_action_id];
+        std::cerr << "  blocking_action_id=" << blocking_action_id
+                   << " observe_predicate_id=" << a.observe_predicate_id
+                   << " precondition_rpn_size=" << a.precondition_rpn.size() << "\n";
+        std::cerr << "  precondition tokens: ";
+        for (int t : a.precondition_rpn) {
+            if (t >= 0) std::cerr << t << "(" << (belief.is_unknown(t) ? "?" : (belief.is_true(t) ? "T" : "F")) << ") ";
+        }
+        std::cerr << "\n";
+    }
+    if (blocking_fact_tokens != nullptr) {
+        std::cerr << "  blocking_fact_tokens (" << blocking_fact_tokens->size() << "): ";
+        for (int t : *blocking_fact_tokens) std::cerr << t << " ";
+        std::cerr << "\n";
+    }
+    int known_true = 0, known_false = 0, unknown = 0;
+    for (int f = 0; f < problem.total_predicates; ++f) {
+        if (belief.is_unknown(f)) unknown++;
+        else if (belief.is_true(f)) known_true++;
+        else known_false++;
+    }
+    std::cerr << "  belief: known_true=" << known_true << " known_false=" << known_false << " unknown=" << unknown
+               << " / total=" << problem.total_predicates << "\n";
+}
+} // namespace
 
 int CPORSolver::create_root_node(const PartiallySpecifiedState& initial_state) {
     node_pool.emplace_back(initial_state, -1);
     return 0;
+}
+
+BeliefState CPORSolver::build_belief_state_for_node(int node_idx) const {
+    std::vector<int> chain; // node_pool indices, node_idx first, root last -- reversed below.
+    for (int cursor = node_idx; cursor != -1; cursor = node_pool[cursor].parent_idx) {
+        chain.push_back(cursor);
+    }
+    std::reverse(chain.begin(), chain.end()); // now chain.front() is the root, chain.back() is node_idx.
+
+    BeliefState belief(node_pool[chain.front()].state);
+    for (size_t i = 1; i < chain.size(); ++i) {
+        belief.apply_forward_action(node_pool[chain[i]].action_id, node_pool[chain[i]].state);
+    }
+    return belief;
+}
+
+void CPORSolver::ensure_node_bmc(int node_idx) {
+    const ProblemDef& problem = get_global_problem();
+    if (!tree_bmc.has_value()) {
+        tree_bmc.emplace(problem.total_predicates);
+    }
+    if (tree_bmc->has(node_idx)) return;
+
+    int parent_idx = node_pool[node_idx].parent_idx;
+    if (parent_idx == -1) {
+        tree_bmc->build_root(node_idx, node_pool[node_idx].state, problem);
+        return;
+    }
+    ensure_node_bmc(parent_idx); // fills in any not-yet-cached ancestors first
+    tree_bmc->build_child(node_idx, parent_idx, problem.actions[node_pool[node_idx].action_id],
+                           node_pool[node_idx].state, problem);
+}
+
+int CPORSolver::find_cycle_ancestor_position(const PartiallySpecifiedState& state, const std::vector<int>& current_path_indices) const {
+    for (size_t p = 0; p < current_path_indices.size(); ++p) {
+        if (node_pool[current_path_indices[p]].state == state) {
+            return static_cast<int>(p);
+        }
+    }
+    return -2;
 }
 
 // -----------------------------------------------------------------------------
@@ -92,21 +208,77 @@ bool CPORSolver::is_action_applicable(const GroundedAction& action, const Partia
 int CPORSolver::compute_heuristic(const PartiallySpecifiedState& state) {
     // The candidate-generation loop in solve_from_node calls this once per applicable
     // action per node -- memoize by belief state so repeated/overlapping branches don't
-    // re-pay for sampling + a bounded BFS on a state we've already scored.
+    // re-pay for a fresh FF/BFS search on a state we've already scored.
     auto cached = heuristic_cache.find(state);
     if (cached != heuristic_cache.end()) {
         return cached->second;
     }
 
     const ProblemDef& problem = get_global_problem();
+    int h = score_concrete_sample(state, problem);
+    heuristic_cache[state] = h;
+    return h;
+}
 
-    // Extract exactly ONE determinized reality from the belief state to feed the classical solver
-    auto samples = SDRSampler::sample_concrete_states(state, problem, 1);
-    if (samples.empty()) {
-        heuristic_cache[state] = 999999; // Mathematically Dead State (Zero valid models)
-        return 999999;
-    }
+int CPORSolver::score_sensing_candidate(const PartiallySpecifiedState& state, int observe_fluent) {
+    // Mirror expand_sensing_node's own deduction pipeline exactly (see its doc
+    // comment): apply_provenance_deductions() lets this genuine observation get
+    // abduced backward into whichever single conditional-effect condition it
+    // resolves (e.g. narrowing a position fact via a prior `checking`'s
+    // now-resolvable provenance), and apply_oneof_deductions() then closes the
+    // loop the other way (a narrowed oneof can make another provenance entry
+    // resolvable, and vice versa -- hence bracketing oneof on both sides,
+    // exactly as expand_sensing_node does). Without this, this scoring function
+    // was blind to sensing's real narrowing power: it could only ever see the
+    // OBSERVED fact itself change, never any position fact it happens to
+    // resolve, so a sense that genuinely collapses a 9-way ambiguity down to 1
+    // scored identically to one that resolves nothing at all -- confirmed as
+    // the reason goal_reached_successes stayed at 0 across a 5-minute
+    // localize5-tamer run despite a fully sound, well-ordered search: the
+    // heuristic could never distinguish real disambiguation progress from
+    // none, since expand_sensing_node's own (correct) narrowing was invisible
+    // to it.
+    PartiallySpecifiedState branch_true = state;
+    branch_true.set_known_value(observe_fluent, true);
+    branch_true.apply_provenance_deductions();
+    apply_oneof_deductions(branch_true);
+    branch_true.apply_provenance_deductions();
+    int h_true = compute_heuristic(branch_true);
 
+    PartiallySpecifiedState branch_false = state;
+    branch_false.set_known_value(observe_fluent, false);
+    branch_false.apply_provenance_deductions();
+    apply_oneof_deductions(branch_false);
+    branch_false.apply_provenance_deductions();
+    int h_false = compute_heuristic(branch_false);
+
+    // A branch the cheap FF/BFS search can't see a bounded path through isn't
+    // proof that branch is truly dead (see score_concrete_sample's own note on
+    // BFSSolver's bounded horizon) -- clamp instead of propagating the 999999
+    // "definitively excluded" sentinel, so a sensing candidate whose one hard
+    // branch just needs more (BMC-driven) work later doesn't get silently
+    // dropped from consideration the way a genuinely dead classical candidate
+    // would be.
+    constexpr int UNRESOLVED_BRANCH_PENALTY = 200;
+    if (h_true >= 999999) h_true = UNRESOLVED_BRANCH_PENALTY;
+    if (h_false >= 999999) h_false = UNRESOLVED_BRANCH_PENALTY;
+
+    // Combine as MIN(h_true, h_false) + 1, not their SUM. This is a ranking
+    // signal compared directly against classical candidates' own h = path.size()
+    // (a single-branch count, not an AND-node total) -- summing both branches
+    // put sensing on a structurally larger scale than any classical action
+    // could ever show, so best-first ordering silently starved it: confirmed on
+    // blocks7-tamer (a genuinely contingent domain with real senseON/senseCLEAR/
+    // senseONTABLE actions), where branch_admissibility_checks stayed at 0 for
+    // 30s straight -- every classical-looking-but-ultimately-futile action chain
+    // got tried, to the full depth cap, before sensing was ever once attempted.
+    // MIN keeps sensing's reported cost on the same order of magnitude as a
+    // single classical step, so it competes fairly instead of being drowned out
+    // by its own two-branch bookkeeping.
+    return 1 + std::min(h_true, h_false);
+}
+
+int CPORSolver::score_concrete_sample(const PartiallySpecifiedState& sample, const ProblemDef& problem) {
     // Prefer FF's relaxed-planning-graph heuristic: it's a real informed heuristic
     // (near-linear per call) rather than a full blind search. FFBridge::build() is
     // called once per problem load (native_bridge.cpp's solve_native()) and only
@@ -117,8 +289,9 @@ int CPORSolver::compute_heuristic(const PartiallySpecifiedState& state) {
     // precondition that's a genuine disjunction FF's model can't express), fall back
     // to the bounded BFS, which is slower but always sound for any RPN formula.
     std::vector<int> path;
+    auto __dbg_ff_t0 = DebugStats::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (FFBridge::is_available()) {
-        path = FFBridge::search(samples[0]);
+        path = FFBridge::search(sample);
     } else {
         // This is a heuristic signal, not a plan-extraction search: bound it hard and
         // mute its logging. An unbounded BFS here (the previous behavior) turns
@@ -141,19 +314,21 @@ int CPORSolver::compute_heuristic(const PartiallySpecifiedState& state) {
         // putting_away_toys without materially slowing FF-available domains (doors7/unix9
         // never exercise this path at all, since FFBridge::build() succeeds for both).
         constexpr int HEURISTIC_MAX_EXPANSIONS = 20000;
-        path = BFSSolver::solve(samples[0], problem, HEURISTIC_MAX_EXPANSIONS, /*verbose=*/false);
+        path = BFSSolver::solve(sample, problem, HEURISTIC_MAX_EXPANSIONS, /*verbose=*/false);
+    }
+    if (DebugStats::enabled()) {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __dbg_ff_t0).count();
+        DebugStats::record_ff_call(ms);
     }
 
     int h;
     if (path.empty()) {
         // If empty, check if it's already the goal. If not, treat it as a dead end
         // within this bounded search horizon.
-        h = Evaluator::evaluate(problem.goal_rpn, samples[0], EvalMode::PESSIMISTIC) ? 0 : 999999;
+        h = Evaluator::evaluate(problem.goal_rpn, sample, EvalMode::PESSIMISTIC) ? 0 : 999999;
     } else {
         h = static_cast<int>(path.size());
     }
-
-    heuristic_cache[state] = h;
     return h;
 }
 
@@ -164,13 +339,47 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
     const ProblemDef& problem = get_global_problem();
     PartiallySpecifiedState current_state = node_pool[node_idx].state;
 
+    // Keeps tree_bmc's persistent path solver synced to node_idx for the whole
+    // duration of this call (see ensure_node_bmc's own doc comment and
+    // Z3BMCManager::enter_node's doc comment for why this eliminates the
+    // O(depth) re-assertion that used to dominate every branch-admissibility
+    // check and rescue-path query). Bracketing the WHOLE function body (instead
+    // of only the AND-node/rescue call sites that actually query it) means the
+    // three recursive calls below (child_idx/t_idx/f_idx) always find
+    // current_top_ already sitting at their own parent when THEY enter, which is
+    // exactly the fast path -- solve_from_node's own call structure is a real
+    // DFS, so this mirrors it exactly.
+    ensure_node_bmc(node_idx);
+    BmcNodeScope __bmc_scope(*tree_bmc, node_idx, node_pool[node_idx].parent_idx);
+
+    if (std::getenv("CPOR_DEBUG_STATE_DUMP") && node_idx == std::atoi(std::getenv("CPOR_DEBUG_STATE_DUMP"))) {
+        const ProblemDef& p = get_global_problem();
+        std::cerr << "[DBG-STATE] node_idx=" << node_idx << " depth=" << depth << ": ";
+        for (int id = 0; id < p.total_predicates; ++id) {
+            if (current_state.is_true(id)) std::cerr << id << "=T ";
+            else if (current_state.is_false(id)) std::cerr << id << "=F ";
+        }
+        std::cerr << std::endl;
+    }
+
     // Depth Protection: hitting the bound means the search is inconclusive here,
     // not that the state is proven unsolvable -- must never be cached as a failure.
     // Reported as -1, a position "before the root": it is always less than every
     // real stack position (which start at 0), so it can never satisfy the
     // self-containment check below and permanently blocks caching for every
     // ancestor on this path, exactly like the depth cap always has.
-    if (depth > 50) {
+    DebugStats::record_solve_from_node_call(depth);
+    if (depth > MAX_SEARCH_DEPTH) {
+        DebugStats::record_depth_cap_hit();
+        // Diagnostic only: is the search genuinely closing in on the goal when
+        // it runs out of room, or wandering through low-value action chains
+        // that never really progress? See DebugStats::record_depth_cap_h's own
+        // doc comment. Gated on enabled() so this extra compute_heuristic call
+        // (cheap, memoized, but still real work) never fires outside an
+        // explicit CPOR_DEBUG_STATS diagnostic run.
+        if (DebugStats::enabled()) {
+            DebugStats::record_depth_cap_h(compute_heuristic(current_state));
+        }
         if (out_lowlink) *out_lowlink = -1;
         return false;
     }
@@ -211,10 +420,12 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
         node_pool[node_idx].relevant_known = original.relevant_known;
         node_pool[node_idx].relevant_hidden = original.relevant_hidden;
         node_pool[node_idx].has_relevance = original.has_relevance;
+        DebugStats::record_solved_cache_hit();
         if (out_lowlink) *out_lowlink = NO_CYCLE;
         return true;
     }
     if (failed_cache.find(current_state) != failed_cache.end()) {
+        DebugStats::record_failed_cache_hit();
         if (out_lowlink) *out_lowlink = NO_CYCLE;
         return false;
     }
@@ -227,14 +438,9 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
     // bottoms out locally (e.g. a reversible action's own trivial round trip) from one
     // that genuinely depends on an outer ancestor still being resolved -- only the
     // latter actually needs to stay uncached.
-    int ancestor_position = -2; // sentinel: "no match found"
-    for (size_t p = 0; p < current_path_indices.size(); ++p) {
-        if (node_pool[current_path_indices[p]].state == current_state) {
-            ancestor_position = static_cast<int>(p);
-            break;
-        }
-    }
+    int ancestor_position = find_cycle_ancestor_position(current_state, current_path_indices);
     if (ancestor_position != -2) {
+        DebugStats::record_cycle_hit();
         // A cycle only proves this path is unproductive, not that the state is
         // unsolvable in general -- its true status is tied to whether the matched
         // ancestor is itself ultimately resolved (by other, non-cyclic means). Report
@@ -244,29 +450,175 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
         return false;
     }
 
-    // Goal Check
+    // Goal Check.
+    //
+    // A regression-fallback goal check (build_belief_state_for_node +
+    // verify_condition_safely) was tried here once before, using the OLD
+    // O(depth)-per-node regression machinery, and reverted -- see git history
+    // for that attempt's own reasoning. tree_bmc changes the cost picture
+    // entirely: node_idx's path solver is already synced (see
+    // ensure_node_bmc/BmcNodeScope above), so this fallback is one more
+    // push/check/pop against an already-built encoding, not a fresh O(depth)
+    // walk. Needed for real, not speculative: confirmed root cause of
+    // goal_reached_successes staying at 0 across a 5-minute localize5-tamer
+    // run despite a fully sound, well-guided search -- a fact like at(p5-5)
+    // can be PROVABLY true given the sensing history (tree_bmc already proves
+    // this correctly for branch-admissibility) while permanently UNKNOWN in
+    // the flat belief bits, because record_conditional_provenance's own
+    // (sound) ambiguity guard can never abduce it for a domain like this
+    // one's shared-signature `checking` action -- see
+    // Z3BMCManager::is_rpn_impossible's own doc comment for the full
+    // reasoning. This vacuous conclusion is exactly like an AND-node's
+    // BMC-vacuous branch (see NO_CYCLE's own doc comment): history-dependent,
+    // not derivable from current_state's flat bits alone, so it must use the
+    // -1 "never self-contained" sentinel rather than NO_CYCLE, or a
+    // DIFFERENT node_idx reaching this identical flat state via a different
+    // history could wrongly inherit this node's cached solved_cache entry.
+    // Both branches below are a genuine goal LEAF: chosen_action_id stays at
+    // its -1 default (extract_node's own contract for "solved, no further
+    // action needed" -- see problem_grounder.py). But node_idx can be
+    // RE-ENTERED into solve_from_node more than once (e.g. close_node_and_
+    // propagate's own "give the exhaustive search a fresh chance from
+    // parent_idx" re-invoking fallback_to_exhaustive_search(node_idx) after
+    // an earlier attempt already tried and abandoned some AND-node candidate,
+    // leaving true_child_idx/false_child_idx pointing at that attempt's own
+    // (possibly still-unresolved) t_idx/f_idx) -- the candidate loop below
+    // clears these defensively on every iteration for exactly this reason
+    // ("Clear any child links a previously-tried-and-abandoned candidate"),
+    // but an early return here skips that loop entirely. Without this reset,
+    // extract_node can reach a stale, never-resolved child through this
+    // node's own leftover true_child_idx/false_child_idx even though THIS
+    // node is correctly marked solved -- confirmed as the cause of
+    // extract_node's "reached an unsolved node" assertion once the BMC
+    // fallback below started actually proving goals true.
+    node_pool[node_idx].single_child_idx = -1;
+    node_pool[node_idx].true_child_idx = -1;
+    node_pool[node_idx].false_child_idx = -1;
+
     if (Evaluator::evaluate(problem.goal_rpn, current_state, EvalMode::PESSIMISTIC)) {
+        DebugStats::record_goal_reached_success();
         node_pool[node_idx].is_solved = true;
         solved_cache[current_state] = node_idx;
         if (out_lowlink) *out_lowlink = NO_CYCLE;
+        return true;
+    }
+    if (tree_bmc->is_rpn_impossible(node_idx, RegressionEngine::negate_rpn(problem.goal_rpn))) {
+        DebugStats::record_goal_reached_success();
+        node_pool[node_idx].is_solved = true;
+        // Vacuous/history-dependent -- see this whole check's doc comment.
+        if (out_lowlink) *out_lowlink = -1;
         return true;
     }
 
     current_path_indices.push_back(node_idx);
     std::vector<ActionCandidate> candidates;
 
+    // Lazy/selective history-aware rescue for candidates the cheap heuristic marks
+    // dead. compute_heuristic's cheap path samples a concrete world consistent only
+    // with this node's own flat bitset + the problem's static oneof/or constraints --
+    // nothing ties an unresolved fact (e.g. a still-unknown `at` position) to other
+    // facts ALREADY known via history (e.g. sensor readings), because that link only
+    // exists procedurally inside an action's conditional effects, never as a standing
+    // Z3 axiom. So the cheap sampler can silently pick a physically-inconsistent
+    // witness -- one where a known fact and an unresolved one couldn't actually
+    // co-occur under the domain's own dynamics -- and score every candidate as dead
+    // from it, even when a real solution exists.
+    //
+    // Escalating on EVERY candidate would fix this but reintroduces the O(depth)
+    // build_belief_state_for_node walk plus a full derive_learned_constraints
+    // regression on every single heuristic call -- confirmed experimentally to turn
+    // a sub-second (wrong-answer) solve into one that doesn't finish in 10 minutes.
+    // Since h is never trusted as ground truth (only used to admit/order candidates;
+    // real correctness is enforced by is_action_applicable's sound Evaluator check
+    // and, for any committed action, by solve_cpor_loop's belief-based validation),
+    // there is nothing to lose by trying the cheap path first everywhere and only
+    // paying for the expensive, history-aware resample on the specific candidates it
+    // was about to discard -- candidates the cheap path already scores as viable never
+    // pay this cost at all.
+    //
+    // Even lazy-per-candidate wasn't enough on its own via the old regress_rpn-based
+    // constraint derivation: re-deriving node_idx's own (pre-candidate) constraints,
+    // and each rescued candidate's own new step, meant converting increasingly large
+    // RPN formulas to Z3 expressions on every rescue call -- confirmed to reach over a
+    // million tokens and >150ms/call by depth ~20 in localize5-tamer. tree_bmc (a
+    // CPORSolver member, persistent across the WHOLE solve -- see its own declaration
+    // and ensure_node_bmc's doc comment) replaces that whole pipeline: node_idx's
+    // history is encoded once, ever, incrementally extending its parent's already-
+    // cached encoding rather than rebuilding from the root every time, and each
+    // rescued candidate just extends node_idx's own cached encoding by its one action
+    // via extend_and_sample -- see Z3BMCManager's own doc comment for the full
+    // rationale.
+
     // Generate Candidates
     for (size_t i = 0; i < problem.actions.size(); ++i) {
         const GroundedAction& action = problem.actions[i];
         if (is_action_applicable(action, current_state)) {
-
+            auto __dbg_cand_t0 = DebugStats::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             // Lookahead determinization logic
             PartiallySpecifiedState projected_state = current_state;
             ActionApplier::apply_action(action, projected_state);
 
-            int h = compute_heuristic(projected_state);
+            // For a classical action (not sensing), projected_state IS exactly
+            // the OR-node child's would-be state -- if it trivially cycles back
+            // to an already-visited ancestor, the "Attempt Execution" loop below
+            // will discard it via the identical check anyway (see
+            // find_cycle_ancestor_position's own doc comment), so skip paying
+            // for compute_heuristic (and possibly the BMC rescue path) on it
+            // here too. Sensing actions are excluded: their actual AND-node
+            // children (t_idx/f_idx) come from expand_sensing_node forcing the
+            // observed fact definitively, not from this optimistic projection,
+            // so this check wouldn't be checking the right state for them.
+            if (action.observe_predicate_id == -1 &&
+                find_cycle_ancestor_position(projected_state, current_path_indices) != -2) {
+                if (DebugStats::enabled()) {
+                    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __dbg_cand_t0).count();
+                    DebugStats::record_candidate_block(ms);
+                }
+                continue;
+            }
+
+            int h;
+            if (action.observe_predicate_id != -1) {
+                // ActionApplier::apply_action is a no-op for a pure sensing
+                // action, so projected_state == current_state here -- scoring
+                // it via compute_heuristic would show zero improvement no
+                // matter how valuable the sense actually is. score_sensing_candidate
+                // looks at what each hypothetical observation outcome actually
+                // unlocks instead (see its own doc comment).
+                h = score_sensing_candidate(current_state, action.observe_predicate_id);
+            } else {
+                h = compute_heuristic(projected_state);
+                if (h == 999999) {
+                    DebugStats::record_rescue_call();
+                    // Extends node_idx's cached encoding by this ONE candidate's own
+                    // action, scoped to its own throwaway solver (node_idx's own cached
+                    // encoding is untouched, ready for the next candidate or a future
+                    // descendant) -- returns a fully determinized, history-consistent
+                    // sample if one exists, or nullopt if the resulting state is
+                    // genuinely impossible given history (the same "Mathematically Dead
+                    // State" conclusion compute_heuristic's own cheap path reaches, just
+                    // soundly re-derived with history taken into account instead of
+                    // guessed at from an uninformed sample).
+                    auto __dbg_ns_t0 = DebugStats::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    auto rescued_sample = tree_bmc->extend_and_sample(node_idx, action, projected_state, problem);
+                    if (DebugStats::enabled()) {
+                        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __dbg_ns_t0).count();
+                        DebugStats::record_new_step_call(ms);
+                    }
+                    h = rescued_sample.has_value() ? score_concrete_sample(*rescued_sample, problem) : 999999;
+                    if (std::getenv("CPOR_DEBUG_RESCUE")) {
+                        std::cerr << "[DBG-RESCUE] node_idx=" << node_idx << " depth=" << depth
+                                  << " candidate_action=" << i << " bmc_sample=" << rescued_sample.has_value()
+                                  << " rescued_h=" << h << std::endl;
+                    }
+                }
+            }
             if (h < 999999) {
                 candidates.push_back({static_cast<int>(i), h});
+            }
+            if (DebugStats::enabled()) {
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __dbg_cand_t0).count();
+                DebugStats::record_candidate_block(ms);
             }
         }
     }
@@ -309,18 +661,51 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
             PartiallySpecifiedState next_state = current_state;
             ActionApplier::apply_action(action, next_state);
 
+            // Cheap pre-filter: skip the node_pool allocation + full recursive
+            // solve_from_node call (its own BMC enter_node/exit_node push/pop,
+            // heuristic computation, cache lookups) for a candidate whose
+            // resulting state trivially cycles back to an already-visited
+            // ancestor on this path -- solve_from_node would immediately
+            // rediscover exactly this at its own top and return false anyway.
+            // See find_cycle_ancestor_position's own doc comment: confirmed via
+            // CPOR_DEBUG_STATS this was over half of ALL solve_from_node calls
+            // on localize5-tamer (cycle_hits=16704 of 31926), every one paying
+            // full recursion cost -- including a node_pool entry that then sat
+            // in memory forever -- just to hit this same conclusion.
+            int pre_ancestor_position = find_cycle_ancestor_position(next_state, current_path_indices);
+            if (pre_ancestor_position != -2) {
+                DebugStats::record_cycle_hit();
+                node_lowlink = std::min(node_lowlink, pre_ancestor_position);
+                continue;
+            }
+
             int child_idx = static_cast<int>(node_pool.size());
             node_pool.emplace_back(next_state, action.id);
             node_pool[child_idx].parent_idx = node_idx;
             node_pool[node_idx].single_child_idx = child_idx;
 
             int child_lowlink = NO_CYCLE;
-            if (solve_from_node(child_idx, current_path_indices, depth + 1, &child_lowlink)) {
+            bool child_solved = solve_from_node(child_idx, current_path_indices, depth + 1, &child_lowlink);
+            if (std::getenv("CPOR_DEBUG_RESCUE")) {
+                std::cerr << "[DBG-ATTEMPT] node_idx=" << node_idx << " depth=" << depth
+                          << " OR action=" << action.id << " h=" << candidate.h_score
+                          << " child_idx=" << child_idx << " child_solved=" << child_solved << std::endl;
+            }
+            if (child_solved) {
+                DebugStats::record_or_node_success();
                 node_pool[node_idx].is_solved = true;
                 node_pool[node_idx].chosen_action_id = action.id;
-                solved_cache[current_state] = node_idx;
+                // Only cache if child_lowlink says this success is genuinely
+                // self-contained -- see the AND-node branch below for why this
+                // matters (same reasoning, though OR-node children never get a
+                // vacuous BMC marking themselves; child_lowlink already reflects
+                // whatever taint its OWN recursive resolution picked up, via
+                // this same fix applied recursively).
+                if (child_lowlink >= depth) {
+                    solved_cache[current_state] = node_idx;
+                }
                 current_path_indices.pop_back();
-                if (out_lowlink) *out_lowlink = NO_CYCLE;
+                if (out_lowlink) *out_lowlink = child_lowlink;
                 return true;
             }
             node_lowlink = std::min(node_lowlink, child_lowlink);
@@ -330,31 +715,128 @@ bool CPORSolver::solve_from_node(int node_idx, std::vector<int>& current_path_in
             // Optimization: If we already know the observation, it's just a regular action.
             if (!current_state.is_unknown(action.observe_predicate_id)) continue;
 
+            // Branch admissibility: an AND-node normally requires BOTH the observed-true
+            // and observed-false outcomes to independently yield a plan. But the flat
+            // bitset alone can't see that one of those outcomes may already be
+            // impossible given history -- e.g. in localize5, once free-up and free-down
+            // are both known true, no real position also allows free-left true, yet
+            // without this check the search still opens that branch and requires it to
+            // find its own plan, which of course it never can (confirmed via a direct
+            // state dump: a node reachable in the tree had all four of
+            // free-up/down/left/right known true simultaneously, a combination no
+            // position in the domain supports). A branch Z3-entailment proves impossible
+            // given this node's own history can never actually be reached at execution
+            // time, so it's vacuously satisfied rather than something requiring its own
+            // solution -- exactly the same "provably true, not proven by the flat bits
+            // alone" reasoning the goal-check/dead-end-check machinery already relies on
+            // elsewhere, just applied before opening a branch instead of after.
+            // tree_bmc (see its own declaration, and ensure_node_bmc's doc comment):
+            // node_idx's encoding is built at most once, ever, across the whole
+            // search tree, incrementally extending its parent's already-cached
+            // encoding -- replaces the get_regressed_query/regress_rpn path, whose
+            // formula size grew combinatorially with history depth (measured to
+            // exceed a million RPN tokens and ~150ms/call by depth ~20), and the
+            // first (time-indexed, rebuilt-per-node) BMC version, which stayed
+            // linear-sized per query but still paid O(depth) to rebuild from the
+            // root for every node with zero sharing across the tree.
+            DebugStats::record_branch_admissibility_check();
+            auto __dbg_bv_t0 = DebugStats::enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            bool true_impossible = tree_bmc->is_impossible(node_idx, action.observe_predicate_id, true);
+            bool false_impossible = tree_bmc->is_impossible(node_idx, action.observe_predicate_id, false);
+            if (DebugStats::enabled()) {
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - __dbg_bv_t0).count();
+                DebugStats::record_branch_verify_call(ms);
+            }
+            if (true_impossible && false_impossible) {
+                // Both outcomes provably impossible -- current_state itself is
+                // contradictory given history. Shouldn't normally happen; treat this
+                // candidate conservatively as failing rather than asserting anything.
+                continue;
+            }
+
             expand_sensing_node(node_idx, action.id, action.observe_predicate_id, current_state);
 
             int t_idx = node_pool[node_idx].true_child_idx;
             int f_idx = node_pool[node_idx].false_child_idx;
 
-            // BOTH branches must yield a valid plan
+            // BOTH branches must yield a valid plan -- except a provably impossible one,
+            // which is marked solved (matching exactly how a genuine goal-node is left:
+            // is_solved=true, chosen_action_id/single_child_idx at their -1 defaults)
+            // instead of being recursed into, since it can never actually be reached.
             int t_lowlink = NO_CYCLE;
-            bool t_solved = solve_from_node(t_idx, current_path_indices, depth + 1, &t_lowlink);
+            bool t_solved;
+            if (true_impossible) {
+                node_pool[t_idx].is_solved = true;
+                t_solved = true;
+                // This "solved" conclusion is vacuous -- it holds only because
+                // tree_bmc->is_impossible proved it given node_idx's own full
+                // ANCESTOR HISTORY, not from current_state's flat bits alone (see
+                // this whole branch's own doc comment above). solved_cache/
+                // failed_cache are keyed on flat state only: a DIFFERENT node_idx
+                // reaching this identical flat state via a different history
+                // could get a different true_impossible verdict from tree_bmc, so
+                // any success or failure that passes through this vacuous branch
+                // must never be cached under that key. Reuse the depth-cap's own
+                // -1 sentinel (see NO_CYCLE's doc comment): "never self-contained,
+                // permanently blocks caching along the whole current path" is
+                // exactly the semantics needed here too. Confirmed as the root
+                // cause of a false UNSOLVABLE_PROVEN on localize5-tamer once the
+                // heuristic fix made the search efficient enough to actually reach
+                // this code path: a node whose AND-node candidate failed only
+                // because of a sibling's genuine failure (not this vacuous branch)
+                // was getting permanently failed_cache'd, even though the vacuous
+                // conclusion it depended on doesn't hold for every node sharing
+                // that flat state.
+                t_lowlink = -1;
+            } else {
+                t_solved = solve_from_node(t_idx, current_path_indices, depth + 1, &t_lowlink);
+            }
+            if (std::getenv("CPOR_DEBUG_RESCUE")) {
+                std::cerr << "[DBG-ATTEMPT] node_idx=" << node_idx << " depth=" << depth
+                          << " AND(sense) action=" << action.id << " h=" << candidate.h_score
+                          << " t_idx=" << t_idx << " t_solved=" << t_solved
+                          << " true_impossible=" << true_impossible << std::endl;
+            }
             if (!t_solved) {
                 node_lowlink = std::min(node_lowlink, t_lowlink);
                 continue; // Early short-circuit
             }
 
             int f_lowlink = NO_CYCLE;
-            bool f_solved = solve_from_node(f_idx, current_path_indices, depth + 1, &f_lowlink);
-            node_lowlink = std::min(node_lowlink, f_lowlink);
+            bool f_solved;
+            if (false_impossible) {
+                node_pool[f_idx].is_solved = true;
+                f_solved = true;
+                f_lowlink = -1; // vacuous -- see t_lowlink's doc comment above
+            } else {
+                f_solved = solve_from_node(f_idx, current_path_indices, depth + 1, &f_lowlink);
+            }
+            if (std::getenv("CPOR_DEBUG_RESCUE")) {
+                std::cerr << "[DBG-ATTEMPT] node_idx=" << node_idx << " depth=" << depth
+                          << " AND(sense) action=" << action.id << " h=" << candidate.h_score
+                          << " f_idx=" << f_idx << " f_solved=" << f_solved
+                          << " false_impossible=" << false_impossible << std::endl;
+            }
 
             if (t_solved && f_solved) {
+                DebugStats::record_and_node_success();
                 node_pool[node_idx].is_solved = true;
                 node_pool[node_idx].chosen_action_id = action.id;
-                solved_cache[current_state] = node_idx;
+                // Both branches' own low-links (real or vacuous) decide whether
+                // THIS success is safe to cache -- computed fresh from just this
+                // candidate's t_lowlink/f_lowlink, not the shared node_lowlink
+                // aggregate (which may carry unrelated taint from previously
+                // tried, failed candidates at this same node and would be overly
+                // conservative here).
+                int candidate_lowlink = std::min(t_lowlink, f_lowlink);
+                if (candidate_lowlink >= depth) {
+                    solved_cache[current_state] = node_idx;
+                }
                 current_path_indices.pop_back();
-                if (out_lowlink) *out_lowlink = NO_CYCLE;
+                if (out_lowlink) *out_lowlink = candidate_lowlink;
                 return true;
             }
+            node_lowlink = std::min({node_lowlink, t_lowlink, f_lowlink});
         }
     }
 
@@ -393,15 +875,73 @@ int CPORSolver::find_resolving_sensing_action(const std::vector<int>& blocked_pr
     return -1;
 }
 
+const std::vector<bool>& CPORSolver::get_predicate_can_become_unknown(const ProblemDef& problem) {
+    if (!predicate_can_become_unknown_.has_value()) {
+        std::vector<bool> can_become_unknown(problem.total_predicates, false);
+        for (const auto& action : problem.actions) {
+            for (int p : action.non_deterministic_effects) {
+                if (p >= 0 && p < problem.total_predicates) can_become_unknown[p] = true;
+            }
+            // ActionApplier's OTHER path to UNKNOWN, distinct from
+            // non_deterministic_effects: a conditional effect whose
+            // condition evaluates to VAL_UNKNOWN (not definitively true or
+            // false) at apply time degrades every one of ITS effect facts to
+            // unknown too (see ActionApplier.hpp's "4. Apply Non-Deterministic
+            // Degradation" section and the VAL_UNKNOWN branch just above it).
+            // Missing this here was a real bug, not just a missed
+            // optimization: wumpus05-tamer (percept-driven conditional
+            // effects) regressed to a 30s+ timeout when this prune first
+            // shipped without it, because a fact that genuinely CAN still
+            // become unknown via such an effect was wrongly declared
+            // permanently resolved, short-circuiting
+            // find_resolving_sensing_action_via_prefix's BFS away from a
+            // resolver that actually existed.
+            for (const auto& ce : action.conditional_effects) {
+                for (const auto& eff : ce.effects) {
+                    if (eff.first >= 0 && eff.first < problem.total_predicates) can_become_unknown[eff.first] = true;
+                }
+            }
+        }
+        predicate_can_become_unknown_ = std::move(can_become_unknown);
+    }
+    return *predicate_can_become_unknown_;
+}
+
 int CPORSolver::find_resolving_sensing_action_via_prefix(const std::vector<int>& blocked_precondition_rpn,
                                                            const PartiallySpecifiedState& belief,
                                                            std::vector<int>& out_prefix_actions) {
     // Depth 0: the cheap, common case (doors/wumpus/ebtcs-shaped domains,
     // where the resolving sensing action is already applicable right now).
     int direct = find_resolving_sensing_action(blocked_precondition_rpn, belief);
-    if (direct != -1) return direct;
+    if (direct != -1) {
+        DebugStats::record_prefix_search_found_direct();
+        return direct;
+    }
 
     const ProblemDef& problem = get_global_problem();
+
+    // Upfront prune: chaining through MORE classical actions can only ever
+    // turn up a resolver for a token that's currently known if some action
+    // could make that token unknown again (see
+    // get_predicate_can_become_unknown's doc comment). If every token in
+    // blocked_precondition_rpn is already known AND can never become
+    // unknown, the full BFS below is guaranteed to explore its entire
+    // MAX_SENSING_PREFIX_DEPTH x MAX_VISITED_STATES budget and still find
+    // nothing -- confirmed on doors15-tamer, where a permanently-resolved
+    // `opened(p)` (never any action's effect at all) sent this search
+    // through its whole budget on every single call, turning solve_cpor_loop's
+    // "replan instead of falling back" fix (see its own comment) into a
+    // 300s+ timeout even after fallback_calls itself dropped to 0.
+    bool any_token_still_reachable = false;
+    for (int token : blocked_precondition_rpn) {
+        if (token < 0) continue;
+        if (belief.is_unknown(token)) { any_token_still_reachable = true; break; }
+        if (get_predicate_can_become_unknown(problem)[token]) { any_token_still_reachable = true; break; }
+    }
+    if (!any_token_still_reachable) {
+        DebugStats::record_prefix_search_exhausted();
+        return -1;
+    }
 
     struct SearchState {
         PartiallySpecifiedState belief;
@@ -437,7 +977,10 @@ int CPORSolver::find_resolving_sensing_action_via_prefix(const std::vector<int>&
                 PartiallySpecifiedState next_belief = node.belief;
                 ActionApplier::apply_action(action, next_belief);
                 if (visited.count(next_belief)) continue;
-                if (visited.size() >= MAX_VISITED_STATES) return -1;
+                if (visited.size() >= MAX_VISITED_STATES) {
+                    DebugStats::record_prefix_search_cut_off_budget();
+                    return -1;
+                }
                 visited.insert(next_belief);
 
                 std::vector<int> next_prefix = node.prefix;
@@ -445,6 +988,7 @@ int CPORSolver::find_resolving_sensing_action_via_prefix(const std::vector<int>&
 
                 int resolver = find_resolving_sensing_action(blocked_precondition_rpn, next_belief);
                 if (resolver != -1) {
+                    DebugStats::record_prefix_search_found_chained();
                     out_prefix_actions = std::move(next_prefix);
                     return resolver;
                 }
@@ -453,11 +997,22 @@ int CPORSolver::find_resolving_sensing_action_via_prefix(const std::vector<int>&
         }
         frontier = std::move(next_frontier);
     }
+    // Distinguishes WHY the search gave up: frontier.empty() means it was
+    // genuinely exhausted (no more reachable classical-action states to try --
+    // no resolver exists within this search's own model at all), while a
+    // still-non-empty frontier means MAX_SENSING_PREFIX_DEPTH cut it off with
+    // more left to explore -- a resolver might exist just beyond the bound.
+    if (frontier.empty()) {
+        DebugStats::record_prefix_search_exhausted();
+    } else {
+        DebugStats::record_prefix_search_cut_off_depth();
+    }
     return -1;
 }
 
 bool CPORSolver::fallback_to_exhaustive_search(int node_idx) {
     ++fallback_invocation_count;
+    DebugStats::record_fallback_call();
     std::vector<int> path;
     path.reserve(64);
     // A fresh, empty path means this call's own internal cycle detection is
@@ -807,6 +1362,12 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
     std::vector<int> open_stack;
     open_stack.push_back(root_idx);
 
+    // Safety cap for the "replan instead of falling back" retry below (see
+    // the ran_off_end_goal_not_met handler): bounds how many extra
+    // compute_linear_plan hops a single node_idx pop may take before giving
+    // up and reaching for fallback_to_exhaustive_search after all.
+    constexpr int MAX_REPLAN_HOPS = 5;
+
     while (!open_stack.empty()) {
         int node_idx = open_stack.back();
         open_stack.pop_back();
@@ -894,6 +1455,16 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
         }
 
         // 1. Goal check.
+        //
+        // A regression-fallback goal check here too (build_belief_state_for_node
+        // + verify_condition_safely on the goal formula itself) was tried and
+        // reverted: it's a pure add-on cost with no measured benefit --
+        // localize5-tamer's stuck nodes turned out to already be genuinely
+        // dead (compute_heuristic finds zero valid Z3 models for every
+        // candidate action there, true independent of this fallback) -- a
+        // different, deeper problem a goal-check fallback was never going to
+        // reach. See solve_from_node's own near-identical revert (same root
+        // cause) for the fuller rationale. Keep this check cheap.
         if (Evaluator::evaluate(problem.goal_rpn, node_belief, EvalMode::PESSIMISTIC)) {
             node_pool[node_idx].is_solved = true;
             solved_cache[node_belief] = node_idx;
@@ -906,11 +1477,52 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
 
         // 2. OnlinePlan: ask SDRPlanner's witness-validated deliberation for a
         // partial plan ending at the goal or at a safe, informative sensing
-        // action.
-        BeliefState wrapped_belief(node_belief);
+        // action. Threads this node's own inherited guide witness in/out --
+        // copied into locals first since compute_linear_plan doesn't touch
+        // node_pool itself, but the emplace_back calls later in this loop
+        // iteration (creating child nodes) can reallocate it, so nothing
+        // below may hold a reference into node_pool[node_idx] across those.
+        //
+        // wrapped_belief is built with full ancestor history (not just the
+        // bare node_belief) so that compute_linear_plan's own internal
+        // derive_learned_constraints-informed witness sampling actually has
+        // something to work with. This is NOT free -- build_belief_state_for_node
+        // walks node_idx's full ancestor chain, an O(depth) cost -- but unlike
+        // the goal-check fallback above, dropping it was tried and regressed
+        // localize5-tamer's behavior: without real learned-constraint context
+        // here, compute_linear_plan's witness sampling loses the very
+        // information that keeps the offline tree's dead-end pruning
+        // effective, and the runaway node-count explosion this wiring was
+        // originally introduced to fix comes back. Keeping it costs real time
+        // on other domains (e.g. blocks7-tamer) but is load bearing for
+        // offline convergence, so it stays -- paid exactly ONCE per node_idx
+        // pop below, then threaded through every replan-retry hop via
+        // apply_forward_action (O(1) amortized) rather than rebuilt from
+        // scratch each hop. An earlier version of the hop loop below simply
+        // requeued cursor_idx through open_stack on each retry, which paid
+        // this O(depth) cost again on EVERY hop -- confirmed via
+        // CPOR_DEBUG_STATS on doors15-tamer to turn what should have been a
+        // cheap retry into an O(depth^2) 300s+ timeout of its own, even after
+        // fallback_calls itself had dropped to 0.
+        BeliefState wrapped_belief = build_belief_state_for_node(node_idx);
+        bool cursor_has_witness = node_pool[node_idx].has_guide_witness;
+        PartiallySpecifiedState cursor_witness = node_pool[node_idx].guide_witness;
+        int cursor_idx = node_idx;
+        PartiallySpecifiedState cursor_belief = node_belief;
+
+        // Bounded replan-retry loop: normally resolves (goal reached, sensing
+        // branch queued, or a genuine failure) within its first pass. Loops
+        // again, up to MAX_REPLAN_HOPS times, only for the specific case
+        // where a partial plan ran to completion without reaching the goal
+        // AND sensing genuinely can't help (see the "Sensing genuinely can't
+        // help here" comment below) -- mirroring C#'s CPORPlanner, which
+        // simply re-invokes classical planning from wherever its stack
+        // currently sits instead of reaching for an expensive AND/OR
+        // fallback whenever nothing is left to observe.
+        for (int hop = 0; ; ++hop) {
         int blocking_action_id = -1;
         std::vector<int> blocking_fact_tokens;
-        std::vector<int> partial_plan = SDRPlanner::compute_linear_plan(wrapped_belief, problem, CPOR_LOOP_WITNESS_SAMPLE_COUNT, &blocking_action_id, &blocking_fact_tokens);
+        std::vector<int> partial_plan = SDRPlanner::compute_linear_plan(wrapped_belief, problem, CPOR_LOOP_WITNESS_SAMPLE_COUNT, &blocking_action_id, &blocking_fact_tokens, &cursor_has_witness, &cursor_witness);
 
         if (partial_plan.empty()) {
             // compute_linear_plan may have truncated to nothing because its
@@ -920,10 +1532,14 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
             // (blocking_action_id == -1, blocking_fact_tokens covers this
             // case instead) -- not because no plan exists at all. Try
             // sensing before assuming the online loop is stuck.
-            if (!try_resolve_via_sensing_branch(node_idx, blocking_action_id, node_belief, problem, open_stack, &blocking_fact_tokens)) {
+            if (!try_resolve_via_sensing_branch(cursor_idx, blocking_action_id, cursor_belief, problem, open_stack, &blocking_fact_tokens)) {
+                if (std::getenv("CPOR_DEBUG_FALLBACK")) {
+                    int d = 0; for (int c = cursor_idx; node_pool[c].parent_idx != -1; c = node_pool[c].parent_idx) ++d;
+                    trace_fallback_trigger("empty_plan", cursor_idx, d, cursor_belief, problem, blocking_action_id, &blocking_fact_tokens);
+                }
                 fallback_to_exhaustive_search(node_idx);
             }
-            continue;
+            break;
         }
 
         // 3. Execute the partial plan action by action, re-validating each
@@ -932,8 +1548,6 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
         // direct Evaluator call against the fully-materialized belief rather
         // than the C# original's regress-to-root, since this engine already
         // keeps a full PartiallySpecifiedState at every node).
-        int cursor_idx = node_idx;
-        PartiallySpecifiedState cursor_belief = node_belief;
         bool branched = false;
         bool aborted = false;
 
@@ -949,6 +1563,10 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
                     branched = true;
                 } else {
                     aborted = true;
+                    if (std::getenv("CPOR_DEBUG_FALLBACK")) {
+                        int d = 0; for (int c = cursor_idx; node_pool[c].parent_idx != -1; c = node_pool[c].parent_idx) ++d;
+                        trace_fallback_trigger("aborted_precondition_failure", cursor_idx, d, cursor_belief, problem, action_id, nullptr);
+                    }
                 }
                 break;
             }
@@ -958,9 +1576,26 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
                 // -- the two children get their own independent OnlinePlan
                 // calls on later stack pops.
                 expand_sensing_node(cursor_idx, action.id, action.observe_predicate_id, cursor_belief);
+                int t_idx = node_pool[cursor_idx].true_child_idx;
+                int f_idx = node_pool[cursor_idx].false_child_idx;
+                // Only the branch that agrees with what the inherited witness
+                // itself already observes may inherit it -- exactly the same
+                // guard SDRPlanner::apply_observation uses when a real
+                // observation contradicts guide_witness_. The other branch
+                // starts fresh (has_guide_witness left false), since the
+                // witness's hidden-state hypothesis is now known wrong there.
+                if (cursor_has_witness) {
+                    if (cursor_witness.is_true(action.observe_predicate_id)) {
+                        node_pool[t_idx].has_guide_witness = true;
+                        node_pool[t_idx].guide_witness = cursor_witness;
+                    } else {
+                        node_pool[f_idx].has_guide_witness = true;
+                        node_pool[f_idx].guide_witness = cursor_witness;
+                    }
+                }
                 node_pool[cursor_idx].chosen_action_id = action.id;
-                open_stack.push_back(node_pool[cursor_idx].false_child_idx);
-                open_stack.push_back(node_pool[cursor_idx].true_child_idx);
+                open_stack.push_back(f_idx);
+                open_stack.push_back(t_idx);
                 branched = true;
                 break;
             }
@@ -968,10 +1603,22 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
             // Classical action (or a sensing action whose value we already
             // know, which behaves like one -- same optimization solve_from_node
             // applies).
+            if (cursor_has_witness) {
+                ActionApplier::apply_action(action, cursor_witness);
+            }
             ActionApplier::apply_action(action, cursor_belief);
+            // Keeps wrapped_belief's own history in lockstep with cursor_belief
+            // (O(1) amortized) so a later hop in THIS SAME loop never needs to
+            // rebuild it via build_belief_state_for_node -- see this loop's
+            // header comment.
+            wrapped_belief.apply_forward_action(action.id, cursor_belief);
             int child_idx = static_cast<int>(node_pool.size());
             node_pool.emplace_back(cursor_belief, action.id);
             node_pool[child_idx].parent_idx = cursor_idx;
+            if (cursor_has_witness) {
+                node_pool[child_idx].has_guide_witness = true;
+                node_pool[child_idx].guide_witness = cursor_witness;
+            }
             node_pool[cursor_idx].single_child_idx = child_idx;
             node_pool[cursor_idx].chosen_action_id = action.id;
             cursor_idx = child_idx;
@@ -979,71 +1626,115 @@ bool CPORSolver::solve_cpor_loop(int root_idx) {
 
         if (aborted) {
             fallback_to_exhaustive_search(node_idx);
-            continue;
+            break;
         }
 
-        if (!branched) {
-            // Ran off the end of partial_plan without hitting a sensing
-            // branch -- per OnlinePlan's own contract this should mean the
-            // goal now holds. Verified rather than assumed: if it doesn't,
-            // there are three possible reasons, cheapest-to-check first:
-            //  1. compute_linear_plan truncated the tail of its own
-            //     candidate_plan on a witness-blocked action -- blocking_action_id
-            //     names it.
-            //  2. FFSolver::search found nothing at all for the guide
-            //     witness -- blocking_fact_tokens (from that same, now-stale
-            //     top-of-loop compute_linear_plan call) names candidates.
-            //  3. Neither of the above: candidate_plan was non-empty and
-            //     passed 4A/4C's multi-witness validation cleanly (every
-            //     sampled witness already agreed on it), yet still doesn't
-            //     establish the actual goal against the REAL belief -- e.g.
-            //     the goal references a fact that happened to already hold
-            //     in every sampled witness by chance, so no action in the
-            //     plan was ever needed (or chosen) to establish it, even
-            //     though it's still genuinely unknown here. blocking_action_id
-            //     and the stale blocking_fact_tokens both miss this case (it
-            //     never truncated anything), so re-scan the goal directly
-            //     against cursor_belief -- the actual belief at this point,
-            //     not the one compute_linear_plan reasoned about before any
-            //     of partial_plan executed.
-            if (Evaluator::evaluate(problem.goal_rpn, cursor_belief, EvalMode::PESSIMISTIC)) {
-                node_pool[cursor_idx].is_solved = true;
-                solved_cache[cursor_belief] = cursor_idx;
-                if (problem.is_simple) {
-                    compute_and_register_relevance(cursor_idx);
-                }
-                close_node_and_propagate(cursor_idx);
-            } else {
-                std::vector<int> goal_blocking_tokens;
-                for (int token : problem.goal_rpn) {
-                    if (token >= 0 && cursor_belief.is_unknown(token)) {
-                        goal_blocking_tokens.push_back(token);
-                    }
-                }
-                if (goal_blocking_tokens.empty()) {
-                    // The goal formula itself doesn't mention any currently-unknown
-                    // fact -- the block is one step removed (e.g. the chosen
-                    // plan's own object bindings only make sense for whichever
-                    // witness FF happened to be guided by, so the goal was
-                    // technically reachable *for that witness* without ever
-                    // resolving some other, non-goal fact this belief still
-                    // doesn't know). Fall back to every unresolved fact in the
-                    // real belief, exactly like compute_linear_plan's own
-                    // candidate_plan.empty() fallback (see its comment).
-                    for (int pred_id = 0; pred_id < problem.total_predicates; ++pred_id) {
-                        if (cursor_belief.is_unknown(pred_id)) {
-                            goal_blocking_tokens.push_back(pred_id);
-                        }
-                    }
-                }
-                const std::vector<int>* tokens_to_try = !goal_blocking_tokens.empty() ? &goal_blocking_tokens : &blocking_fact_tokens;
-                if (!try_resolve_via_sensing_branch(cursor_idx, blocking_action_id, cursor_belief, problem, open_stack, tokens_to_try)) {
-                    fallback_to_exhaustive_search(node_idx);
+        if (branched) {
+            // The two new children (or a sensing-resolution branch queued by
+            // try_resolve_via_sensing_branch above) are already on open_stack
+            // and will eventually resolve node_idx via close_node_and_propagate.
+            break;
+        }
+
+        // Ran off the end of partial_plan without hitting a sensing
+        // branch -- per OnlinePlan's own contract this should mean the
+        // goal now holds. Verified rather than assumed: if it doesn't,
+        // there are three possible reasons, cheapest-to-check first:
+        //  1. compute_linear_plan truncated the tail of its own
+        //     candidate_plan on a witness-blocked action -- blocking_action_id
+        //     names it.
+        //  2. FFSolver::search found nothing at all for the guide
+        //     witness -- blocking_fact_tokens (from that same, now-stale
+        //     top-of-loop compute_linear_plan call) names candidates.
+        //  3. Neither of the above: candidate_plan was non-empty and
+        //     passed 4A/4C's multi-witness validation cleanly (every
+        //     sampled witness already agreed on it), yet still doesn't
+        //     establish the actual goal against the REAL belief -- e.g.
+        //     the goal references a fact that happened to already hold
+        //     in every sampled witness by chance, so no action in the
+        //     plan was ever needed (or chosen) to establish it, even
+        //     though it's still genuinely unknown here. blocking_action_id
+        //     and the stale blocking_fact_tokens both miss this case (it
+        //     never truncated anything), so re-scan the goal directly
+        //     against cursor_belief -- the actual belief at this point,
+        //     not the one compute_linear_plan reasoned about before any
+        //     of partial_plan executed.
+        if (Evaluator::evaluate(problem.goal_rpn, cursor_belief, EvalMode::PESSIMISTIC)) {
+            node_pool[cursor_idx].is_solved = true;
+            solved_cache[cursor_belief] = cursor_idx;
+            if (problem.is_simple) {
+                compute_and_register_relevance(cursor_idx);
+            }
+            close_node_and_propagate(cursor_idx);
+            break;
+        }
+
+        std::vector<int> goal_blocking_tokens;
+        for (int token : problem.goal_rpn) {
+            if (token >= 0 && cursor_belief.is_unknown(token)) {
+                goal_blocking_tokens.push_back(token);
+            }
+        }
+        if (goal_blocking_tokens.empty()) {
+            // The goal formula itself doesn't mention any currently-unknown
+            // fact -- the block is one step removed (e.g. the chosen
+            // plan's own object bindings only make sense for whichever
+            // witness FF happened to be guided by, so the goal was
+            // technically reachable *for that witness* without ever
+            // resolving some other, non-goal fact this belief still
+            // doesn't know). Fall back to every unresolved fact in the
+            // real belief, exactly like compute_linear_plan's own
+            // candidate_plan.empty() fallback (see its comment).
+            for (int pred_id = 0; pred_id < problem.total_predicates; ++pred_id) {
+                if (cursor_belief.is_unknown(pred_id)) {
+                    goal_blocking_tokens.push_back(pred_id);
                 }
             }
         }
-        // If branched, the two new children are already on open_stack and
-        // will eventually resolve node_idx via close_node_and_propagate.
+        const std::vector<int>* tokens_to_try = !goal_blocking_tokens.empty() ? &goal_blocking_tokens : &blocking_fact_tokens;
+        if (try_resolve_via_sensing_branch(cursor_idx, blocking_action_id, cursor_belief, problem, open_stack, tokens_to_try)) {
+            break; // sensing branch queued
+        }
+
+        // Sensing genuinely can't help here (tokens_to_try was empty, or
+        // nothing observes what it named) -- confirmed via CPOR_DEBUG_FALLBACK
+        // tracing on doors15-tamer: every captured trigger of this reason hit
+        // the exact same wall, belief.unknown == 0 (all 450 facts already
+        // resolved), blocked on move's `opened(?j)` precondition, which is
+        // never any action's effect in this domain (see d.pddl -- opened is
+        // observe-only) so once known it can never change. That does NOT
+        // mean cursor_idx is stuck: a fully-resolved belief with goal still
+        // false is a plain classical replanning opportunity (e.g. route
+        // around the now-known-closed door), exactly what C#'s stack-based
+        // CPORPlanner.Plan()/OfflinePlanning already does for free by just
+        // re-invoking classical search at whatever state the stack currently
+        // holds -- it never needs an equivalent expensive AND/OR fallback for
+        // a state with nothing left to observe. Mirror that here instead of
+        // reaching straight for fallback_to_exhaustive_search: loop back
+        // (hop) and call compute_linear_plan again fresh against
+        // wrapped_belief/cursor_belief, giving it another, better-informed
+        // shot at routing around whatever blocked this attempt.
+        //
+        // Bounded via MAX_REPLAN_HOPS rather than left to bounce forever: a
+        // hop that finds a non-empty partial_plan always advances
+        // cursor_belief by >=1 real action first (see the
+        // `for (int action_id : partial_plan)` loop above), so it can't
+        // re-enter this exact branch at an unchanged belief; a hop that
+        // finds nothing at all lands in the sibling partial_plan.empty()
+        // branch, which resolves (sense or fallback) immediately. Genuine
+        // infinite bouncing shouldn't be reachable by either path, but the
+        // cap is kept as a cheap guard against corner cases this reasoning
+        // missed.
+        if (hop < MAX_REPLAN_HOPS) {
+            continue;
+        }
+        if (std::getenv("CPOR_DEBUG_FALLBACK")) {
+            int d = 0; for (int c = cursor_idx; node_pool[c].parent_idx != -1; c = node_pool[c].parent_idx) ++d;
+            trace_fallback_trigger("ran_off_end_goal_not_met", cursor_idx, d, cursor_belief, problem, blocking_action_id, tokens_to_try);
+        }
+        fallback_to_exhaustive_search(node_idx);
+        break;
+        } // hop loop
         } catch (const std::exception&) {
             // See fallback_to_exhaustive_search's identical catch: covers
             // both std::bad_alloc (out-of-memory during this iteration's own
