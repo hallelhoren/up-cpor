@@ -1,12 +1,4 @@
-import os
-import sys
 from itertools import chain, combinations, islice
-
-# Set environment variables for Python.NET on macOS
-# using the Mono runtime installed via Homebrew.
-if sys.platform == "darwin":
-    os.environ["PYTHONNET_RUNTIME"] = "mono"
-    os.environ["PYTHONNET_MONO_LIBMONO"] = "/opt/homebrew/opt/mono/lib/libmonosgen-2.0.dylib"
 
 import pytest
 from unified_planning.engines.results import PlanGenerationResultStatus

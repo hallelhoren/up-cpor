@@ -1,11 +1,9 @@
-import os
 import re
 import random
 from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict
-import tempfile
 
 from pysmt.environment import reset_env as reset_pysmt_env
 
@@ -24,56 +22,10 @@ def reset_test_seeds(seed: int = TEST_RANDOM_SEED) -> None:
     random.seed(seed)
     reset_pysmt_env()
 
-    from up_cpor.converter import UpCporConverter
-
-    UpCporConverter.set_random_seed(seed)
-
-    from CPORLib.Tools import GenericArraySet
-    from CPORLib.LogicalUtilities import Predicate, GroundedPredicateFactory
-
-    GenericArraySet[Predicate].Reset()
-    GroundedPredicateFactory.Reset()
-
 
 @lru_cache(maxsize=None)
 def parse_expected_dot(domain: str) -> Dict[str, object]:
     return parse_dot(TESTS_DIR / domain / "out.txt")
-
-
-@lru_cache(maxsize=None)
-def solve_cpor_offline(domain: str) -> Dict[str, object]:
-    from up_cpor.converter import UpCporConverter
-    from CPORLib.Algorithms import CPORPlanner
-    from up_test_utils import make_test_environment, parse_test_problem
-
-    reset_test_seeds(TEST_RANDOM_SEED)
-    problem = parse_test_problem(domain, make_test_environment())
-
-    converter = UpCporConverter()
-    c_domain = converter.createDomain(problem)
-    c_problem = converter.createProblem(problem, c_domain)
-
-    planner = CPORPlanner(c_domain, c_problem)
-    solution = planner.OfflinePlanning()
-    assert solution is not None, f"CPOR failed to find a solution for {domain}"
-
-    is_valid = planner.ValidatePlanGraph(solution)
-
-    fd, raw_path = tempfile.mkstemp(suffix=".dot")
-    os.close(fd)
-    dot_path = Path(raw_path)
-    try:
-        planner.WritePlan(str(dot_path), solution)
-        dot_text = dot_path.read_text(encoding="utf-8")
-        dot_graph = parse_dot(dot_path)
-    finally:
-        dot_path.unlink(missing_ok=True)
-
-    return {
-        "dot_text": dot_text,
-        "dot_graph": dot_graph,
-        "is_valid": is_valid,
-    }
 
 
 def parse_dot(path: Path) -> Dict[str, object]:
